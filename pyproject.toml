@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-jev"
+version = "0.1.0"
+description = "Foundation for a Windows voice-controlled computer-use agent"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "pywinauto>=0.6.9,<0.7; sys_platform == 'win32'",
+    "Pillow>=11,<13; sys_platform == 'win32'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10"]
+
+[tool.setuptools.packages.find]
+include = ["voice*", "computer*", "decision*", "agent*", "safety*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
