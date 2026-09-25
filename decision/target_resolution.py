@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import hashlib
+import json
 import re
 import unicodedata
 
@@ -22,6 +24,43 @@ class RoleCompatibility(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DomainSemanticCompatibility(StrEnum):
+    """How candidate meaning compares with the requested domain entity kind."""
+
+    EXACT = "exact"
+    COMPATIBLE = "compatible"
+    CONTRADICTORY = "contradictory"
+    UNKNOWN = "unknown"
+
+
+class PresentationRole(StrEnum):
+    """Normalized UI presentation role, separate from target/domain meaning."""
+
+    BUTTON = "button"
+    LINK = "link"
+    LIST_ITEM = "list_item"
+    ROW = "row"
+    CARD = "card"
+    TREE_ITEM = "tree_item"
+    TAB = "tab"
+    MENU_ITEM = "menu_item"
+    TEXT_FIELD = "text_field"
+    SEARCH_FIELD = "search_field"
+    CHECKBOX = "checkbox"
+    TOGGLE = "toggle"
+    CONTAINER = "container"
+    LABEL = "label"
+    UNKNOWN = "unknown"
+
+
+class PresentationCompatibility(StrEnum):
+    """Structural suitability of a UI presentation for the requested action."""
+
+    COMPATIBLE = "compatible"
+    INCOMPATIBLE = "incompatible"
+    UNKNOWN = "unknown"
+
+
 class TargetResolutionStatus(StrEnum):
     UNIQUE = "unique"
     CHOICE = "choice"
@@ -31,12 +70,17 @@ class TargetResolutionStatus(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class TargetSpec:
-    """Bounded user intent, independent of application and provider."""
+    """Bounded intent; ``desired_role`` is a domain/target semantic role."""
 
     primary_identity: str
     qualifiers: tuple[str, ...] = ()
     desired_role: str | None = None
     action_intent: str = "activate"
+
+    @property
+    def domain_semantic_role(self) -> str | None:
+        """Descriptive alias clarifying that ``desired_role`` is not a UI role."""
+        return self.desired_role
 
     def __post_init__(self) -> None:
         if not _valid_text(self.primary_identity, 200):
@@ -52,8 +96,45 @@ class TargetSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectedGroundingEvidence:
+    """Local binding between a directed request and one returned candidate.
+
+    The fingerprints are hashes of locally constructed request data. The
+    provider does not create or control this record.
+    """
+
+    target_spec_fingerprint: str
+    objective_fingerprint: str
+    snapshot_id: str
+    previous_snapshot_id: str
+    candidate_id: str
+    max_elements: int
+
+    def __post_init__(self) -> None:
+        for name, value in (
+            ("target_spec_fingerprint", self.target_spec_fingerprint),
+            ("objective_fingerprint", self.objective_fingerprint),
+        ):
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                raise ValueError(f"{name} must be a SHA-256 hex digest")
+        if not _valid_text(self.snapshot_id, 128):
+            raise ValueError("snapshot_id must contain 1 to 128 safe characters")
+        if not isinstance(self.previous_snapshot_id, str) or len(self.previous_snapshot_id) > 128:
+            raise ValueError("previous_snapshot_id must contain at most 128 characters")
+        if not _valid_text(self.candidate_id, 80):
+            raise ValueError("candidate_id must contain 1 to 80 safe characters")
+        if type(self.max_elements) is not int or not 1 <= self.max_elements <= 100:
+            raise ValueError("max_elements must be between 1 and 100")
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateEvidence:
-    """Separated semantic fields and local authorization facts for one snapshot."""
+    """Domain meaning, presentation, and authorization facts for one snapshot.
+
+    ``semantic_role`` remains as a compatibility alias for older callers.
+    New adapters should set ``target_semantic_evidence`` and
+    ``presentation_role`` independently.
+    """
 
     candidate_id: str
     primary_text: str
@@ -65,6 +146,9 @@ class CandidateEvidence:
     source: str
     snapshot_id: str
     provider_role: str | None = None
+    target_semantic_evidence: str | None = None
+    presentation_role: PresentationRole | str | None = None
+    directed_grounding: DirectedGroundingEvidence | None = None
 
     def __post_init__(self) -> None:
         if not _valid_text(self.candidate_id, 80):
@@ -76,9 +160,24 @@ class CandidateEvidence:
         if any(not isinstance(value, str) or len(value) > 200 or "\x00" in value
                for value in self.secondary_text):
             raise ValueError("secondary_text values must be strings of at most 200 characters")
-        for name, value in (("semantic_role", self.semantic_role), ("provider_role", self.provider_role)):
+        for name, value in (
+            ("semantic_role", self.semantic_role), ("provider_role", self.provider_role),
+            ("target_semantic_evidence", self.target_semantic_evidence),
+        ):
             if value is not None and (not isinstance(value, str) or len(value) > 80 or "\x00" in value):
                 raise ValueError(f"{name} must be None or a string of at most 80 characters")
+        if self.presentation_role is not None and not isinstance(
+            self.presentation_role, (str, PresentationRole),
+        ):
+            raise ValueError("presentation_role must be a normalized role or bounded string")
+        if isinstance(self.presentation_role, str) and (
+            len(self.presentation_role) > 80 or "\x00" in self.presentation_role
+        ):
+            raise ValueError("presentation_role must contain at most 80 safe characters")
+        if self.directed_grounding is not None and not isinstance(
+            self.directed_grounding, DirectedGroundingEvidence,
+        ):
+            raise ValueError("directed_grounding must be typed local evidence")
         if any(type(value) is not bool for value in (
             self.actionable, self.geometry_valid, self.safety_eligible,
         )):
@@ -105,6 +204,10 @@ class CandidateResolution:
     snapshot_valid: bool
     admissible: bool
     rejection_reasons: tuple[str, ...] = ()
+    target_semantic_evidence: str | None = None
+    domain_semantic_compatibility: DomainSemanticCompatibility = DomainSemanticCompatibility.UNKNOWN
+    presentation_role: PresentationRole = PresentationRole.UNKNOWN
+    presentation_compatibility: PresentationCompatibility = PresentationCompatibility.UNKNOWN
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +234,25 @@ def _normalize(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", value).casefold())
     without_marks = "".join(char for char in decomposed if not unicodedata.combining(char))
     return " ".join(re.findall(r"[^\W_]+", without_marks, flags=re.UNICODE))
+
+
+def target_spec_fingerprint(target: TargetSpec) -> str:
+    """Return a stable opaque fingerprint without exposing target text."""
+    payload = json.dumps(
+        (target.primary_identity, target.qualifiers, target.desired_role, target.action_intent),
+        ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def grounding_objective_fingerprint(objective: str) -> str:
+    """Return a stable opaque fingerprint for the exact bounded objective."""
+    return hashlib.sha256(objective.encode("utf-8")).hexdigest()
+
+
+def exact_identity_match(text: str, requested: str) -> bool:
+    """Whether normalized identity text is exactly equal, without phrase matching."""
+    return bool(_normalize(text)) and _normalize(text) == _normalize(requested)
 
 
 def _contains_identity(text: str, requested: str) -> bool:
@@ -166,7 +288,7 @@ def _qualifier_evidence(
     )
 
 
-_ROLE_ALIASES = {
+_DOMAIN_ROLE_ALIASES = {
     "file": "file",
     "file result": "file",
     "document": "file",
@@ -180,25 +302,110 @@ _ROLE_ALIASES = {
     "directory": "container",
     "container": "container",
     "navigation destination": "navigation_destination",
-    "navigation item": "navigation_destination",
-    "menu item": "navigation_destination",
-    "tab": "navigation_destination",
-    "tab item": "navigation_destination",
-    "actionable item": "actionable_item",
-    "result": "actionable_item",
-    "result item": "actionable_item",
-    "card": "actionable_item",
-    "list item": "actionable_item",
-    "link": "actionable_item",
-    "button": "actionable_item",
+    "media": "media",
+    "media item": "media",
+    "song": "media",
+    "song result": "media",
+    "track": "media",
+    "album": "media",
+    "audio": "media",
+    "video": "media",
+    "image": "media",
+    "setting": "setting",
+    "settings": "setting",
+    "preference": "setting",
 }
 
+_PRESENTATION_ROLE_ALIASES: dict[str, PresentationRole] = {
+    "button": PresentationRole.BUTTON,
+    "push button": PresentationRole.BUTTON,
+    "command button": PresentationRole.BUTTON,
+    "radio button": PresentationRole.BUTTON,
+    "link": PresentationRole.LINK,
+    "hyperlink": PresentationRole.LINK,
+    "anchor": PresentationRole.LINK,
+    "list item": PresentationRole.LIST_ITEM,
+    "listitem": PresentationRole.LIST_ITEM,
+    "list view item": PresentationRole.LIST_ITEM,
+    "option": PresentationRole.LIST_ITEM,
+    "result item": PresentationRole.LIST_ITEM,
+    "row": PresentationRole.ROW,
+    "table row": PresentationRole.ROW,
+    "data row": PresentationRole.ROW,
+    "data item": PresentationRole.ROW,
+    "card": PresentationRole.CARD,
+    "tile": PresentationRole.CARD,
+    "tree item": PresentationRole.TREE_ITEM,
+    "treeitem": PresentationRole.TREE_ITEM,
+    "tab": PresentationRole.TAB,
+    "tab item": PresentationRole.TAB,
+    "tabitem": PresentationRole.TAB,
+    "page tab": PresentationRole.TAB,
+    "menu item": PresentationRole.MENU_ITEM,
+    "menuitem": PresentationRole.MENU_ITEM,
+    "text field": PresentationRole.TEXT_FIELD,
+    "text box": PresentationRole.TEXT_FIELD,
+    "editable field": PresentationRole.TEXT_FIELD,
+    "input field": PresentationRole.TEXT_FIELD,
+    "edit": PresentationRole.TEXT_FIELD,
+    "search field": PresentationRole.SEARCH_FIELD,
+    "search box": PresentationRole.SEARCH_FIELD,
+    "search input": PresentationRole.SEARCH_FIELD,
+    "checkbox": PresentationRole.CHECKBOX,
+    "check box": PresentationRole.CHECKBOX,
+    "check box control": PresentationRole.CHECKBOX,
+    "toggle": PresentationRole.TOGGLE,
+    "toggle button": PresentationRole.TOGGLE,
+    "switch": PresentationRole.TOGGLE,
+    "container": PresentationRole.CONTAINER,
+    "pane": PresentationRole.CONTAINER,
+    "panel": PresentationRole.CONTAINER,
+    "group": PresentationRole.CONTAINER,
+    "list": PresentationRole.CONTAINER,
+    "region": PresentationRole.CONTAINER,
+    "label": PresentationRole.LABEL,
+    "text": PresentationRole.LABEL,
+    "static text": PresentationRole.LABEL,
+    "heading": PresentationRole.LABEL,
+}
+_ACTIVATABLE_PRESENTATION_ROLES = frozenset({
+    PresentationRole.BUTTON, PresentationRole.LINK, PresentationRole.LIST_ITEM,
+    PresentationRole.ROW, PresentationRole.CARD, PresentationRole.TREE_ITEM,
+    PresentationRole.TAB, PresentationRole.MENU_ITEM, PresentationRole.CHECKBOX,
+    PresentationRole.TOGGLE,
+})
 
-def canonical_semantic_role(role: str | None) -> str | None:
+
+def normalize_presentation_role(
+    role: str | PresentationRole | None,
+) -> PresentationRole:
+    if isinstance(role, PresentationRole):
+        return role
+    if not role:
+        return PresentationRole.UNKNOWN
+    normalized = _normalize(role.replace("_", " ").replace("-", " "))
+    return _PRESENTATION_ROLE_ALIASES.get(normalized, PresentationRole.UNKNOWN)
+
+
+def _canonical_domain_role(role: str | None, *, allow_unlisted: bool = False) -> str | None:
     if not role:
         return None
     normalized = _normalize(role.replace("_", " ").replace("-", " "))
-    return _ROLE_ALIASES.get(normalized)
+    if not normalized or normalized in {"unknown", "unspecified", "none"}:
+        return None
+    if normalized.endswith(" like"):
+        normalized = normalized[:-5].strip()
+    if normalize_presentation_role(normalized) is not PresentationRole.UNKNOWN:
+        return None
+    known = _DOMAIN_ROLE_ALIASES.get(normalized)
+    if known is not None:
+        return known
+    return normalized.replace(" ", "_") if allow_unlisted else None
+
+
+def canonical_semantic_role(role: str | None) -> str | None:
+    """Compatibility helper that recognizes domain semantics only."""
+    return _canonical_domain_role(role)
 
 
 def role_compatibility(
@@ -215,6 +422,71 @@ def role_compatibility(
     if candidate == "container":
         return RoleCompatibility.CONTAINER
     return RoleCompatibility.INCOMPATIBLE
+
+
+def domain_semantic_compatibility(
+    desired_role: str | None, candidate_role: str | None, *, explicit: bool = False,
+) -> DomainSemanticCompatibility:
+    desired = _canonical_domain_role(desired_role, allow_unlisted=True)
+    candidate = _canonical_domain_role(candidate_role, allow_unlisted=explicit)
+    if desired is None or candidate is None:
+        return DomainSemanticCompatibility.UNKNOWN
+    if desired == candidate:
+        return DomainSemanticCompatibility.EXACT
+    if desired == "conversation" and candidate == "contact":
+        return DomainSemanticCompatibility.COMPATIBLE
+    return DomainSemanticCompatibility.CONTRADICTORY
+
+
+def presentation_role_compatibility(
+    action_intent: str, presentation_role: str | PresentationRole | None,
+) -> PresentationCompatibility:
+    role = normalize_presentation_role(presentation_role)
+    intent = _normalize(action_intent)
+    if role in {
+        PresentationRole.TEXT_FIELD, PresentationRole.SEARCH_FIELD,
+        PresentationRole.CONTAINER, PresentationRole.LABEL,
+    }:
+        return PresentationCompatibility.INCOMPATIBLE
+    if intent not in {"activate", "select"}:
+        return PresentationCompatibility.UNKNOWN
+    if role in _ACTIVATABLE_PRESENTATION_ROLES:
+        return PresentationCompatibility.COMPATIBLE
+    return PresentationCompatibility.UNKNOWN
+
+
+def _candidate_domain_semantics(candidate: CandidateEvidence) -> tuple[str | None, bool]:
+    if candidate.target_semantic_evidence is not None:
+        return candidate.target_semantic_evidence, True
+    return candidate.semantic_role, False
+
+
+def _candidate_presentation_role(candidate: CandidateEvidence) -> PresentationRole:
+    if candidate.presentation_role is not None:
+        return normalize_presentation_role(candidate.presentation_role)
+    role = normalize_presentation_role(candidate.provider_role)
+    if role is not PresentationRole.UNKNOWN:
+        return role
+    return normalize_presentation_role(candidate.semantic_role)
+
+
+def _overall_role_compatibility(
+    domain: DomainSemanticCompatibility,
+    presentation: PresentationRole,
+    presentation_compatibility: PresentationCompatibility,
+) -> RoleCompatibility:
+    if presentation is PresentationRole.CONTAINER:
+        return RoleCompatibility.CONTAINER
+    if presentation_compatibility is PresentationCompatibility.INCOMPATIBLE:
+        return RoleCompatibility.INCOMPATIBLE
+    if domain is DomainSemanticCompatibility.EXACT:
+        return RoleCompatibility.EXACT
+    if domain is DomainSemanticCompatibility.COMPATIBLE:
+        return RoleCompatibility.COMPATIBLE
+    if domain is DomainSemanticCompatibility.CONTRADICTORY:
+        return RoleCompatibility.INCOMPATIBLE
+    # Generic UI presentation must not rank otherwise equivalent entities.
+    return RoleCompatibility.UNKNOWN
 
 
 _ROLE_STRENGTH = {
@@ -260,7 +532,21 @@ def resolve_target(
             _qualifier_evidence(qualifier, candidate.primary_text, candidate.secondary_text)
             for qualifier in target.qualifiers
         )
-        role = role_compatibility(target.desired_role, candidate.semantic_role)
+        semantic_value, semantic_is_explicit = _candidate_domain_semantics(candidate)
+        semantic_role = (
+            semantic_value if semantic_is_explicit
+            or canonical_semantic_role(semantic_value) is not None else None
+        )
+        domain_compatibility = domain_semantic_compatibility(
+            target.desired_role, semantic_value, explicit=semantic_is_explicit,
+        )
+        presentation = _candidate_presentation_role(candidate)
+        presentation_compatibility = presentation_role_compatibility(
+            target.action_intent, presentation,
+        )
+        role = _overall_role_compatibility(
+            domain_compatibility, presentation, presentation_compatibility,
+        )
         snapshot_valid = candidate.snapshot_id == expected_snapshot_id
         reasons: list[str] = []
         if not candidate.actionable:
@@ -277,6 +563,10 @@ def resolve_target(
             reasons.append("primary_identity_mismatch")
         if IdentityEvidence.MISMATCH in qualifiers:
             reasons.append("qualifier_mismatch")
+        if domain_compatibility is DomainSemanticCompatibility.CONTRADICTORY:
+            reasons.append("contradictory_domain_semantics")
+        if presentation_compatibility is PresentationCompatibility.INCOMPATIBLE:
+            reasons.append("incompatible_presentation_role")
         if role is RoleCompatibility.INCOMPATIBLE:
             reasons.append("incompatible_role")
         if role is RoleCompatibility.CONTAINER:
@@ -284,10 +574,11 @@ def resolve_target(
         admissible = not reasons
         diagnostics.append(CandidateResolution(
             candidate.candidate_id, candidate.primary_text, candidate.secondary_text,
-            candidate.semantic_role, candidate.provider_role, candidate.source,
+            semantic_role, candidate.provider_role, candidate.source,
             candidate.snapshot_id, primary, qualifiers, role,
             candidate.actionable, candidate.geometry_valid, candidate.safety_eligible,
-            snapshot_valid, admissible, tuple(reasons),
+            snapshot_valid, admissible, tuple(reasons), semantic_role,
+            domain_compatibility, presentation, presentation_compatibility,
         ))
         if admissible:
             admissible_ids.append(candidate.candidate_id)

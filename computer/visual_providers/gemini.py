@@ -23,6 +23,7 @@ from computer.visual_providers.common import (
 GEMINI_VISUAL_MODEL = "gemini-3.5-flash-lite"
 GEMINI_GENERIC_MAX_OUTPUT_TOKENS = 8000
 GEMINI_DIRECTED_MAX_OUTPUT_TOKENS = 800
+GEMINI_INTERACTIVE_TIMEOUT_SECONDS = 6.0
 GEMINI_VISUAL_SCHEMA_NAME = "visual_elements"
 GEMINI_VISUAL_SCHEMA_VERSION = "1"
 _API_ROOT = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -143,7 +144,7 @@ class GeminiVisualObserver:
 
     def __init__(
         self, api_key: str, *, model: str = GEMINI_VISUAL_MODEL,
-        max_elements: int = 40, timeout: float = 20,
+        max_elements: int = 40, timeout: float = GEMINI_INTERACTIVE_TIMEOUT_SECONDS,
         directed_max_output_tokens: int = GEMINI_DIRECTED_MAX_OUTPUT_TOKENS,
         transport: JSONTransport | None = None,
         metadata_transport: MetadataTransport | None = None,
@@ -155,8 +156,8 @@ class GeminiVisualObserver:
             raise ValueError("Gemini visual model must be a valid model ID")
         if not 1 <= max_elements <= 100:
             raise ValueError("max_elements must be between 1 and 100")
-        if not 1 <= timeout <= 120:
-            raise ValueError("timeout must be between 1 and 120 seconds")
+        if not 1 <= timeout <= 7:
+            raise ValueError("Gemini visual timeout must be between 1 and 7 seconds")
         if not 128 <= directed_max_output_tokens <= GEMINI_GENERIC_MAX_OUTPUT_TOKENS:
             raise ValueError("directed_max_output_tokens must be between 128 and 8000")
         self._api_key = api_key
@@ -182,7 +183,8 @@ class GeminiVisualObserver:
         return VisualRequestFingerprint(
             self.name, self.model, True, grounding.max_elements,
             self.directed_max_output_tokens, "application/json",
-            GEMINI_VISUAL_SCHEMA_NAME, GEMINI_VISUAL_SCHEMA_VERSION,
+            GEMINI_VISUAL_SCHEMA_NAME,
+            "2" if grounding.verification_only else GEMINI_VISUAL_SCHEMA_VERSION,
             (screenshot.metadata.pixel_width, screenshot.metadata.pixel_height),
             encoded_length, digest, len(grounding.objective),
         )
@@ -221,7 +223,10 @@ class GeminiVisualObserver:
         payload: dict[str, object] = {
             "contents": [{"role": "user", "parts": [
                 {"text": (
-                    directed_visual_prompt(requested_max, grounding.objective)
+                    directed_visual_prompt(
+                        requested_max, grounding.objective,
+                        verification_only=grounding.verification_only,
+                    )
                     if grounding is not None else visual_prompt(requested_max, original_request)
                 )},
                 {"inlineData": {"mimeType": "image/png", "data": png_base64(screenshot)}},
@@ -232,19 +237,26 @@ class GeminiVisualObserver:
                     else GEMINI_GENERIC_MAX_OUTPUT_TOKENS
                 ),
                 "responseMimeType": "application/json",
-                "responseJsonSchema": visual_schema(include_parent=not directed),
+                "responseJsonSchema": visual_schema(
+                    include_parent=not directed,
+                    include_activity=bool(grounding and grounding.verification_only),
+                ),
             },
         }
         request_build_ms = max(0, round((self._clock() - build_started) * 1000))
         started = self._clock()
         try:
             response = self.transport.create(payload, self._api_key, self.timeout)
-        except VisualProviderFailure:
-            raise
+        except VisualProviderFailure as exc:
+            raise exc.with_provider_context(self.name, self.model) from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise VisualProviderFailure("timeout") from exc
+            raise VisualProviderFailure("timeout").with_provider_context(
+                self.name, self.model,
+            ) from exc
         except Exception as exc:
-            raise VisualProviderFailure("unknown_api_error") from exc
+            raise VisualProviderFailure("unknown_api_error").with_provider_context(
+                self.name, self.model,
+            ) from exc
         latency_ms = max(0, round((self._clock() - started) * 1000))
         parse_started = self._clock()
         try:
@@ -254,13 +266,14 @@ class GeminiVisualObserver:
                 candidate_from_normalized(
                     raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
                     parent_required=not directed,
+                    verification_only=bool(grounding and grounding.verification_only),
                 )
                 for raw in raw_elements[:requested_max]
             )
         except VisualProviderFailure as exc:
             if exc.code == "invalid_response":
-                raise VisualProviderFailure("malformed_response") from exc
-            raise
+                exc = VisualProviderFailure("malformed_response")
+            raise exc.with_provider_context(self.name, self.model) from exc
         response_parse_ms = max(0, round((self._clock() - parse_started) * 1000))
         return VisualObservation(
             candidates, self.name, self.model, latency_ms, _usage(response),

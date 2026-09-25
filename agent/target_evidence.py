@@ -8,8 +8,13 @@ import re
 from computer.actions import Action, ClickAction, VisualClickAction
 from computer.models import Observation, Rect
 from decision.context import Redactor
-from decision.target_resolution import CandidateEvidence
+from decision.target_resolution import (
+    CandidateEvidence, DirectedGroundingEvidence, TargetSpec,
+    canonical_semantic_role, grounding_objective_fingerprint,
+    normalize_presentation_role, target_spec_fingerprint,
+)
 from safety.policy import GenericTargetActivationPolicy, generic_uia_semantic_role
+from computer.visual import VisualGroundingRequest
 
 
 MAX_UIA_TARGET_CANDIDATES = 40
@@ -25,6 +30,47 @@ _STRUCTURAL_PARENT_WORDS = frozenset({
 class TargetEvidenceSet:
     candidates: tuple[CandidateEvidence, ...]
     actions: dict[str, Action]
+    conflicting_source_candidate_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class DirectedGroundingBinding:
+    """Controller-owned context for exactly one directed observation call."""
+
+    target_spec_fingerprint: str
+    objective_fingerprint: str
+    snapshot_id: str
+    previous_snapshot_id: str
+    max_elements: int
+
+
+def bind_directed_grounding(
+    target: TargetSpec,
+    request: VisualGroundingRequest,
+    previous_observation: Observation,
+    returned_observation: Observation,
+    *,
+    expected_objective: str,
+) -> DirectedGroundingBinding | None:
+    """Bind returned visual evidence only when the exact directed call is verifiable."""
+    snapshot_id = returned_observation.observation_id
+    metadata = returned_observation.screenshot
+    if (
+        request.objective != expected_objective
+        or not previous_observation.observation_id
+        or not snapshot_id
+        or snapshot_id == previous_observation.observation_id
+        or returned_observation.error
+        or returned_observation.visual_directed_grounding is not True
+        or returned_observation.visual_requested_max_elements != request.max_elements
+        or metadata is None
+        or metadata.snapshot_id != snapshot_id
+    ):
+        return None
+    return DirectedGroundingBinding(
+        target_spec_fingerprint(target), grounding_objective_fingerprint(request.objective),
+        snapshot_id, previous_observation.observation_id, request.max_elements,
+    )
 
 
 def _clean(value: str, redactor: Redactor, maximum: int) -> str:
@@ -47,6 +93,8 @@ def adapt_observation_candidates(
     observation: Observation,
     policy: GenericTargetActivationPolicy,
     redactor: Redactor | None = None,
+    *,
+    grounding_binding: DirectedGroundingBinding | None = None,
 ) -> TargetEvidenceSet:
     """Create source-bound resolver evidence without dropping execution actions."""
     cleaner = redactor or Redactor()
@@ -63,20 +111,23 @@ def adapt_observation_candidates(
         if not primary:
             continue
         action = ClickAction(control.id)
-        role = generic_uia_semantic_role(control)
-        verdict = policy.validate_candidate(action, observation, semantic_role=role)
+        domain_role = generic_uia_semantic_role(control)
+        presentation_role = normalize_presentation_role(control.control_type)
+        verdict = policy.validate_candidate(action, observation, semantic_role=domain_role)
         secondary = _identity_context(control.parent_name, cleaner)
         item = CandidateEvidence(
             candidate_id=control.id,
             primary_text=primary,
             secondary_text=(secondary,) if secondary else (),
-            semantic_role=role,
+            semantic_role=domain_role,
             actionable=(control.visible is True and control.enabled is True),
             geometry_valid=_valid_rect(control.rectangle),
             safety_eligible=verdict.disposition == "allow",
             source="UIA",
             snapshot_id=snapshot_id,
             provider_role=control.control_type[:80] or None,
+            target_semantic_evidence=domain_role,
+            presentation_role=presentation_role,
         )
         evidence.append(item)
         actions[item.candidate_id] = action
@@ -97,17 +148,37 @@ def adapt_observation_candidates(
         )
         verdict = policy.validate_candidate(action, observation)
         secondary = _identity_context(element.parent, cleaner)
+        domain_role = canonical_semantic_role(element.role[:80])
+        presentation_role = normalize_presentation_role(element.role[:80])
         item = CandidateEvidence(
             candidate_id=element.id,
             primary_text=primary,
             secondary_text=(secondary,) if secondary else (),
-            semantic_role=element.role[:80] or None,
+            semantic_role=domain_role,
             actionable=element.clickable is True,
             geometry_valid=geometry_valid,
             safety_eligible=verdict.disposition == "allow",
             source="VISUAL",
             snapshot_id=snapshot_id,
             provider_role=element.role[:80] or None,
+            target_semantic_evidence=domain_role,
+            presentation_role=presentation_role,
+            directed_grounding=(
+                DirectedGroundingEvidence(
+                    grounding_binding.target_spec_fingerprint,
+                    grounding_binding.objective_fingerprint,
+                    grounding_binding.snapshot_id,
+                    grounding_binding.previous_snapshot_id,
+                    element.id,
+                    grounding_binding.max_elements,
+                )
+                if grounding_binding is not None
+                and grounding_binding.snapshot_id == snapshot_id
+                and observation.visual_directed_grounding is True
+                and observation.visual_requested_max_elements == grounding_binding.max_elements
+                and metadata is not None and metadata.snapshot_id == snapshot_id
+                else None
+            ),
         )
         evidence.append(item)
         actions[item.candidate_id] = action
@@ -116,13 +187,19 @@ def adapt_observation_candidates(
     seen: set[str] = set()
     bounded: list[CandidateEvidence] = []
     bounded_actions: dict[str, Action] = {}
+    by_id: dict[str, CandidateEvidence] = {}
+    conflicts: set[str] = set()
     for item in evidence:
         if item.candidate_id in seen:
+            previous = by_id[item.candidate_id]
+            if previous.source != item.source or previous != item:
+                conflicts.add(item.candidate_id)
             continue
         seen.add(item.candidate_id)
         bounded.append(item)
         bounded_actions[item.candidate_id] = actions[item.candidate_id]
-    return TargetEvidenceSet(tuple(bounded), bounded_actions)
+        by_id[item.candidate_id] = item
+    return TargetEvidenceSet(tuple(bounded), bounded_actions, tuple(sorted(conflicts)))
 
 
 def query_literal_from_target(target) -> str:

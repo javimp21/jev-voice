@@ -7,8 +7,13 @@ from dataclasses import asdict
 
 from computer.visual import VisualObserver
 from computer.visual_providers.deepseek import DEEPSEEK_VISUAL_MODEL, DeepSeekVisualObserver
-from computer.visual_providers.gemini import GEMINI_VISUAL_MODEL, GeminiVisualObserver
-from computer.visual_providers.openai import OpenAIVisualObserver
+from computer.visual_providers.failover import GeminiVisualGrounder
+from computer.visual_providers.gemini import (
+    GEMINI_INTERACTIVE_TIMEOUT_SECONDS, GEMINI_VISUAL_MODEL, GeminiVisualObserver,
+)
+from computer.visual_providers.openai import (
+    OPENAI_VISUAL_MODEL, OpenAIVisualGrounder, OpenAIVisualObserver,
+)
 from computer.visual_providers.openrouter import (
     OPENROUTER_FREE_VISUAL_MODEL, OpenRouterVisualObserver,
 )
@@ -68,6 +73,11 @@ def _timeout_seconds() -> float:
     return value
 
 
+def _gemini_timeout_seconds() -> float:
+    """Respect a shorter global timeout and cap the interactive Gemini attempt."""
+    return min(_timeout_seconds(), GEMINI_INTERACTIVE_TIMEOUT_SECONDS)
+
+
 def visual_provider_from_environment() -> VisualObserver | None:
     provider = os.environ.get("VISUAL_PROVIDER", "").strip().casefold()
     if not provider:
@@ -120,9 +130,21 @@ def visual_provider_from_environment() -> VisualObserver | None:
                 "GEMINI_API_KEY is required when VISUAL_PROVIDER=gemini."
             )
         model = os.environ.get("GEMINI_VISUAL_MODEL", GEMINI_VISUAL_MODEL).strip()
+        openai_fallback = None
+        openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+        if openai_api_key:
+            openai_model = os.environ.get("OPENAI_VISUAL_MODEL", OPENAI_VISUAL_MODEL).strip()
+            try:
+                openai_fallback = OpenAIVisualGrounder(
+                    openai_api_key, model=openai_model, max_elements=max_elements,
+                    timeout=timeout,
+                )
+            except ValueError as exc:
+                raise VisualProviderConfigurationError(str(exc)) from exc
         try:
-            return GeminiVisualObserver(
-                api_key, model=model, max_elements=max_elements, timeout=timeout,
+            return GeminiVisualGrounder(
+                api_key, openai_fallback=openai_fallback,
+                model=model, max_elements=max_elements, timeout=_gemini_timeout_seconds(),
                 directed_max_output_tokens=_gemini_directed_max_output_tokens(),
             )
         except ValueError as exc:

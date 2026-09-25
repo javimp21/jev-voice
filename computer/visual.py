@@ -12,8 +12,8 @@ import unicodedata
 
 from computer.models import (
     CaptureDiagnostics, Observation, ProviderErrorDiagnostic, Rect, ScreenshotMetadata,
-    ResultReadinessRichnessRatios, UIElement, VisualElement, VisualReadinessFrame,
-    VisualRequestFingerprint,
+    ResultReadinessRichnessRatios, UIElement, VisualElement, VisualProviderAttempt,
+    VisualReadinessFrame, VisualRequestFingerprint,
 )
 
 
@@ -45,6 +45,7 @@ class VisualCandidate:
     clickable: bool = True
     parent: str = ""
     provider_role: str | None = None
+    activity: str | None = None
 
 
 MAX_GROUNDING_OBJECTIVE_CHARS = 240
@@ -58,6 +59,7 @@ class VisualGroundingRequest:
 
     objective: str
     max_elements: int = 5
+    verification_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.objective.strip() or len(self.objective) > MAX_GROUNDING_OBJECTIVE_CHARS:
@@ -66,6 +68,8 @@ class VisualGroundingRequest:
             )
         if not 1 <= self.max_elements <= 100:
             raise ValueError("max_elements must be between 1 and 100")
+        if type(self.verification_only) is not bool:
+            raise ValueError("verification_only must be a boolean")
 
 
 def bounded_grounding_request(objective: str, max_elements: int = 5) -> VisualGroundingRequest:
@@ -101,15 +105,71 @@ class VisualProviderFailure(RuntimeError):
     def __init__(
         self, code: str, *, http_status: int | None = None,
         provider_code: str | None = None, message: str | None = None,
+        provider_name: str | None = None, provider_model: str | None = None,
+        provider_error_type: str | None = None, provider_request_id: str | None = None,
+        provider_attempts: tuple[VisualProviderAttempt, ...] = (),
+        selected_visual_provider: str | None = None,
+        provider_failover_used: bool = False,
+        provider_failover_reason: str | None = None,
     ) -> None:
+        provider_error_category = _provider_error_category(code)
         diagnostic = ProviderErrorDiagnostic(
             code, http_status, provider_code, message or _PROVIDER_ERROR_MESSAGES.get(
                 code, "Remote visual provider request failed.",
-            ),
+            ), provider_name, provider_model, provider_error_type, provider_request_id,
+            provider_error_category,
         )
         super().__init__(code)
         self.code = code
         self.diagnostic = diagnostic
+        self.provider_attempts = provider_attempts
+        self.selected_visual_provider = selected_visual_provider
+        self.provider_failover_used = provider_failover_used
+        self.provider_failover_reason = provider_failover_reason
+
+    def with_provider_context(
+        self, provider_name: str, provider_model: str, *,
+        provider_error_type: str | None = None, provider_request_id: str | None = None,
+        provider_attempts: tuple[VisualProviderAttempt, ...] | None = None,
+        selected_visual_provider: str | None = None,
+        provider_failover_used: bool | None = None,
+        provider_failover_reason: str | None = None,
+    ) -> VisualProviderFailure:
+        return VisualProviderFailure(
+            self.code, http_status=self.diagnostic.http_status,
+            provider_code=self.diagnostic.provider_code,
+            message=self.diagnostic.message,
+            provider_name=provider_name, provider_model=provider_model,
+            provider_error_type=(provider_error_type or self.diagnostic.provider_error_type),
+            provider_request_id=(provider_request_id or self.diagnostic.provider_request_id),
+            provider_attempts=(self.provider_attempts if provider_attempts is None else provider_attempts),
+            selected_visual_provider=(self.selected_visual_provider if selected_visual_provider is None
+                                      else selected_visual_provider),
+            provider_failover_used=(self.provider_failover_used if provider_failover_used is None
+                                    else provider_failover_used),
+            provider_failover_reason=(self.provider_failover_reason if provider_failover_reason is None
+                                      else provider_failover_reason),
+        )
+
+
+def _provider_error_category(code: str) -> str:
+    if code in {"authentication_error", "permission_error"}:
+        return "authentication"
+    if code in {"payment_required", "quota_exceeded", "insufficient_quota"}:
+        return "quota"
+    if code in {"rate_limited", "rate_limit"}:
+        return "rate_limit"
+    if code == "timeout":
+        return "timeout"
+    if code in {"network_error", "connection_error"}:
+        return "connection"
+    if code == "invalid_request":
+        return "invalid_request"
+    if code in {"malformed_response", "invalid_response", "refusal"}:
+        return "invalid_response"
+    if code in {"server_error", "provider_unavailable"}:
+        return "server"
+    return "unknown"
 
 
 _PROVIDER_ERROR_MESSAGES = {
@@ -148,6 +208,9 @@ class VisualObservation:
     directed_grounding: bool = False
     raw_element_count: int | None = None
     parsed_element_count: int | None = None
+    provider_attempts: tuple[VisualProviderAttempt, ...] = ()
+    provider_failover_used: bool = False
+    provider_failover_reason: str | None = None
 
 
 class ScreenCapture(Protocol):
@@ -344,6 +407,9 @@ def validate_visual_candidates_detailed(
                 or not math.isfinite(candidate.confidence) or not 0 <= candidate.confidence <= 1)):
             rejected["other_validation_failure"] += 1
             continue
+        if candidate.activity not in {None, "active", "not_active", "unknown"}:
+            rejected["other_validation_failure"] += 1
+            continue
         label = _clean_text(candidate.label, max_text)
         raw_role = _clean_text(candidate.role, 40)
         if not label and not raw_role:
@@ -356,7 +422,7 @@ def validate_visual_candidates_detailed(
         validated.append(VisualElement(
             f"v{len(validated) + 1}", label, role, rect,
             float(candidate.confidence) if candidate.confidence is not None else None,
-            candidate.clickable is True, parent,
+            candidate.clickable is True, parent, activity=candidate.activity,
         ))
     return tuple(validated), rejected
 

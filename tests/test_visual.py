@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 import json
 import sys
 import ctypes
@@ -17,7 +17,7 @@ from computer.models import (
     VisualGroundingStatus, VisualRequestFingerprint,
 )
 from computer.visual import (
-    FakeVisualObserver, ScreenshotCapture, VisualCandidate, VisualObservation,
+    FakeVisualObserver, ScreenshotCapture, VisualCandidate, VisualGroundingRequest, VisualObservation,
     VisualProviderFailure,
     deduplicate_visual_elements, deduplicate_visual_elements_within,
     validate_visual_candidates, visual_click_point, visual_fallback_policy, visual_rect_to_screen,
@@ -27,7 +27,7 @@ from computer.visual import (
 )
 from computer import windows, windows_actions
 from computer.windows import WindowsObserver
-from computer.windows_actions import WindowsComputer
+from computer.windows_actions import WindowsComputer, _visual_click_geometry_diagnostics
 from computer.windows_capture import CaptureUnavailable, WindowsWindowCapture
 from computer.windows_capture import save_debug_overlay, save_debug_screenshot
 from decision.jev import JevDecisionMaker
@@ -171,6 +171,51 @@ def test_rich_uia_does_not_capture_or_call_remote_provider(monkeypatch: pytest.M
     assert provider.calls == []
 
 
+def test_activation_visual_verification_reuses_fresh_uia_session_and_masks_password_regions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Node()
+    password = Node("Password", "Edit", runtime_id=(2,), parent=root,
+                    rectangle=Rect(-180, 120, -80, 155))
+    password.element = SimpleNamespace(
+        CurrentHasKeyboardFocus=0, CurrentIsPassword=1, CurrentIsSelected=1,
+    )
+    root.iter_children = lambda: iter((password,))  # type: ignore[method-assign]
+    monkeypatch.setattr(windows, "_foreground", lambda: root)
+    monkeypatch.setattr(windows_actions, "_foreground", lambda: root)
+    monkeypatch.setattr(windows_actions, "_focused", Mock(side_effect=RuntimeError))
+    capture_service = FakeCapture()
+    calls = []
+
+    class Provider:
+        name = "gemini"
+        model = "gemini-3.5-flash-lite"
+        pricing_class = "account_tier_dependent"
+
+        def observe(self, screenshot, window, original_request, grounding=None):
+            calls.append((screenshot, window, original_request, grounding))
+            return VisualObservation((VisualCandidate(
+                "Alpha", "list item", Rect(100, 100, 250, 180), None, False,
+                activity="active",
+            ),), self.name, self.model, directed_grounding=True)
+
+    computer = WindowsComputer(capture_service=capture_service, visual_provider=Provider())
+    fresh = computer.observe_local()
+    assert fresh.elements[0].selected is True
+    grounding = VisualGroundingRequest("Verify Alpha is the active entity.", 5, True)
+
+    verified = computer.verify_activation_postcondition_visual(fresh, grounding)
+
+    assert len(calls) == 1
+    assert calls[0][1] is fresh
+    assert calls[0][3].verification_only is True
+    assert capture_service.sensitive == (password.rectangle,)
+    assert verified.observation_id == fresh.observation_id
+    assert verified.visual_elements[0].activity == "active"
+    assert verified.visual_execution_authorized is False
+    assert calls[0][0].image is None
+
+
 def test_bilingual_consequential_labels_and_safe_navigation() -> None:
     for label in ("Delete", "Send", "Purchase", "Eliminar", "Borrar", "Enviar", "Comprar", "Pagar", "Publicar"):
         obs = observation_with_visual(visual(label=label))
@@ -292,6 +337,173 @@ def test_phase1_executor_issues_one_local_center_click(monkeypatch: pytest.Monke
     second = computer.execute_visual_click_phase1(action, observation, "focus Search", .99)
     assert not second.success
     click.assert_called_once()
+
+
+@pytest.mark.parametrize("provider_name", ["openai", "gemini"])
+def test_generic_visual_target_executor_is_provider_agnostic_and_reports_local_binding(
+    monkeypatch: pytest.MonkeyPatch, provider_name: str,
+) -> None:
+    root = Node()
+    monkeypatch.setattr(windows, "_foreground", lambda: root)
+    monkeypatch.setattr(windows_actions, "_foreground", lambda: root)
+    monkeypatch.setattr(windows_actions, "_focused", Mock(side_effect=RuntimeError))
+    capture = FakeCapture()
+    from computer.visual_providers.common import candidate_from_normalized
+    candidate = candidate_from_normalized({
+        "label": "Iago", "role": "list_item",
+        "box": {"left": 20, "top": 50, "right": 120, "bottom": 125},
+        "clickable": True, "parent": "Chats",
+    }, 1000, 800)
+    assert candidate.rectangle == Rect(20, 40, 120, 100)
+
+    class Provider:
+        name = provider_name
+        model = "mock-visual-model"
+        pricing_class = "free"
+
+        def observe(self, screenshot, window, original_request):
+            return VisualObservation((candidate,), provider_name, self.model, execution_authorized=False)
+
+    click = Mock()
+    monkeypatch.setattr(windows_actions, "_click_point", click)
+    computer = WindowsComputer(capture_service=capture, visual_provider=Provider())
+    computer.set_observation_request("Open chat with Iago")
+    observation = computer.observe()
+    assert [item.id for item in observation.visual_elements] == ["v1"]
+    assert observation.visual_elements[0].label == "Iago"
+    action = VisualClickAction(observation.observation_id, "v1")
+
+    result = computer.execute_generic_target_activation(action, observation)
+
+    assert result.success and result.input_issued
+    click.assert_called_once_with(-165, 135)
+    diagnostic = result.visual_activation_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.candidate_id == "v1"
+    assert diagnostic.candidate_lookup_succeeded
+    assert diagnostic.provenance_valid
+    assert diagnostic.snapshot_binding_valid
+    assert diagnostic.normalized_box_width_bucket == "small"
+    assert diagnostic.normalized_box_height_bucket == "small"
+    assert diagnostic.click_point_relative_bucket == "center:center"
+    assert diagnostic.candidate_box_inside_bound_window is True
+    assert diagnostic.candidate_box_aspect_bucket == "wide"
+    assert diagnostic.overlaps_actionable_candidate is False
+    assert diagnostic.nearest_actionable_neighbor_distance_bucket is None
+    assert not {"x", "y", "coordinates", "rectangle"}.intersection(asdict(diagnostic))
+    assert diagnostic.provider_name == provider_name
+    assert diagnostic.provider_execution_agnostic
+    assert diagnostic.preflight_started and diagnostic.preflight_succeeded
+    assert diagnostic.geometry_resolution_succeeded
+    assert diagnostic.resolved_point_inside_candidate
+    assert diagnostic.resolved_point_inside_bound_window
+    assert diagnostic.foreground_stable_before_input
+    assert diagnostic.input_attempted and diagnostic.input_result == "succeeded"
+    assert diagnostic.snapshot_consumed
+    assert diagnostic.failure_stage is None and diagnostic.failure_reason is None
+    # Raw window handles are not part of the new activation diagnostic.
+    assert "window_handle" not in diagnostic.__dataclass_fields__
+
+
+def test_visual_click_geometry_diagnostic_reports_overlap_and_neighbor_distance_as_buckets() -> None:
+    target = visual(rect=Rect(20, 40, 120, 100))
+    meta = metadata()
+    screen_rect = visual_rect_to_screen(target.rectangle, meta)
+    click_point = visual_click_point(target, meta)
+    observation = replace(
+        observation_with_visual(target),
+        elements=(UIElement(
+            "c1", "Neighbor", "Button", rectangle=Rect(-185, 125, -145, 145),
+            enabled=True, visible=True,
+        ),),
+        visual_elements=(target, VisualElement(
+            "v2", "Other", "button", Rect(121, 40, 170, 100), .9, True,
+        )),
+    )
+
+    diagnostics = _visual_click_geometry_diagnostics(
+        observation, target, meta, screen_rect, click_point,
+    )
+
+    assert diagnostics["overlaps_actionable_candidate"] is True
+    assert diagnostics["nearest_actionable_neighbor_distance_bucket"] == "overlap"
+    assert diagnostics["candidate_box_inside_bound_window"] is True
+    assert diagnostics["click_point_relative_bucket"] == "center:center"
+
+
+def test_generic_visual_target_diagnostics_identify_preflight_and_mouse_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    computer, observation, capture, _provider, click = hybrid_computer(monkeypatch)
+    capture.current = Rect(-200, 100, 301, 500)
+    stale = computer.execute_generic_target_activation(
+        VisualClickAction(observation.observation_id, "v1"), observation,
+    )
+    assert not stale.success and stale.error == "stale_observation"
+    assert stale.visual_activation_diagnostic is not None
+    assert stale.visual_activation_diagnostic.failure_stage == "window_geometry_preflight"
+    assert stale.visual_activation_diagnostic.failure_reason == "window_bounds_changed"
+    assert not stale.visual_activation_diagnostic.input_attempted
+    click.assert_not_called()
+
+    computer, observation, _capture, _provider, click = hybrid_computer(monkeypatch)
+    click.side_effect = OSError("private desktop detail must not escape")
+    failed = computer.execute_generic_target_activation(
+        VisualClickAction(observation.observation_id, "v1"), observation,
+    )
+    assert not failed.success and failed.error == "windows_operation_failed"
+    diagnostic = failed.visual_activation_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.failure_stage == "os_mouse_input"
+    assert diagnostic.failure_reason == "mouse_input_failed_or_unknown"
+    assert diagnostic.input_attempted and diagnostic.input_result == "failed_or_unknown"
+    assert "private desktop" not in str(diagnostic)
+    click.assert_called_once()
+
+
+def test_generic_visual_target_rejects_wrong_and_consumed_snapshots_without_click(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    computer, observation, _capture, _provider, click = hybrid_computer(monkeypatch)
+    wrong = computer.execute_generic_target_activation(
+        VisualClickAction("other-snapshot", "v1"), observation,
+    )
+    assert not wrong.success
+    assert wrong.visual_activation_diagnostic is not None
+    assert not wrong.visual_activation_diagnostic.snapshot_binding_valid
+    assert wrong.visual_activation_diagnostic.failure_stage == "safety_policy"
+    click.assert_not_called()
+
+    computer, observation, _capture, _provider, click = hybrid_computer(monkeypatch)
+    action = VisualClickAction(observation.observation_id, "v1")
+    assert computer.execute_generic_target_activation(action, observation).success
+    second = computer.execute_generic_target_activation(action, observation)
+    assert not second.success
+    assert second.visual_activation_diagnostic is not None
+    assert second.visual_activation_diagnostic.failure_stage == "snapshot_binding"
+    assert second.visual_activation_diagnostic.snapshot_consumed
+    click.assert_called_once()
+
+
+def test_generic_visual_target_rejects_changed_trusted_foreground_before_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    computer, observation, _capture, _provider, click = hybrid_computer(monkeypatch)
+    changed = Node(process_id=77, runtime_id=(77,))
+    monkeypatch.setattr(windows_actions, "_foreground", lambda: changed)
+
+    result = computer.execute_generic_target_activation(
+        VisualClickAction(observation.observation_id, "v1"), observation,
+    )
+
+    assert not result.success and result.error == "unsafe_target"
+    diagnostic = result.visual_activation_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.failure_stage == "foreground_preflight"
+    assert diagnostic.failure_reason == "foreground_or_trusted_window_changed"
+    assert diagnostic.foreground_stable_before_input is False
+    assert not diagnostic.input_attempted
+    click.assert_not_called()
 
 
 @pytest.mark.parametrize("change", ["hwnd", "pid", "bounds", "virtual"])
@@ -854,6 +1066,29 @@ def test_visual_readiness_initially_informative_calls_provider_once(monkeypatch)
     assert capture.calls == 1 and len(provider.payloads) == 1
     assert result.visual_provider_call_count == 1
     assert len(provider.payloads[0]) == result.visual_request_fingerprint.encoded_image_byte_length
+
+
+def test_opt_in_debug_capture_is_retained_for_typed_provider_failure(monkeypatch) -> None:
+    from computer.visual_providers.common import png_bytes
+
+    computer, _capture, provider, _root = readiness_computer(
+        monkeypatch, [True], retain_debug_capture=True,
+    )
+    sent: list[bytes] = []
+
+    def fail_after_send(screenshot, _window, _original_request, _grounding=None):
+        sent.append(png_bytes(screenshot))
+        raise VisualProviderFailure("timeout")
+
+    provider.observe = fail_after_send
+    result = computer.observe_directed(bounded_grounding_request("Find search", 5))
+
+    assert result.visual_provider_error.category == "timeout"
+    retained = computer.take_debug_capture()
+    assert retained is not None
+    assert png_bytes(retained) == sent[0]
+    retained.discard()
+    assert computer.take_debug_capture() is None
 
 
 def test_visual_readiness_uniform_then_informative_reuses_final_capture(monkeypatch) -> None:

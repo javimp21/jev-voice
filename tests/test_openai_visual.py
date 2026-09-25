@@ -9,9 +9,14 @@ import pytest
 from PIL import Image
 
 from computer.models import Observation, Rect, ScreenshotMetadata
-from computer.visual import ScreenshotCapture, VisualProviderFailure, validate_visual_candidates
+from computer.visual import (
+    ScreenshotCapture, VisualGroundingRequest, VisualProviderFailure, bounded_grounding_request,
+    validate_visual_candidates,
+)
 from computer.visual_providers import VisualProviderConfigurationError, visual_provider_from_environment
-from computer.visual_providers.openai import OpenAIVisualObserver
+from computer.visual_providers.openai import (
+    OPENAI_VISUAL_MODEL, OpenAIVisualGrounder, OpenAIVisualObserver,
+)
 
 
 def capture(width: int = 1000, height: int = 500) -> ScreenshotCapture:
@@ -111,6 +116,101 @@ def test_response_envelope_validation(raw) -> None:
     screenshot = capture()
     with pytest.raises(VisualProviderFailure):
         provider.observe(screenshot, Observation("", ""), "inspect")
+    screenshot.discard()
+
+
+def test_openai_fallback_grounder_uses_same_directed_objective_and_candidate_limit() -> None:
+    transport = Mock()
+    directed = element(label="Iago", role="list_item")
+    directed.pop("parent")
+    transport.create.return_value = response([directed])
+    provider = OpenAIVisualGrounder("test-key", transport=transport)
+    screenshot = capture()
+    grounding = bounded_grounding_request("Find the conversation Iago", 3)
+
+    result = provider.observe(
+        screenshot, Observation("app", "Private title"), "ignored context", grounding,
+    )
+
+    payload, key, timeout = transport.create.call_args.args
+    assert payload["model"] == OPENAI_VISUAL_MODEL == "gpt-5.6-luna"
+    assert payload["input"][0]["content"][0]["text"].find("Find the conversation Iago") >= 0
+    assert "ignored context" not in payload["input"][0]["content"][0]["text"]
+    assert payload["max_output_tokens"] == 800
+    schema = payload["text"]["format"]["schema"]["properties"]["elements"]["items"]
+    assert schema["required"] == ["label", "role", "box", "clickable"]
+    assert "parent" not in schema["properties"]
+    assert payload["store"] is False
+    assert payload["input"][0]["content"][1]["image_url"].startswith("data:image/png;base64,")
+    assert key == "test-key" and timeout == 20
+    assert result.requested_max_elements == 3 and result.directed_grounding
+    assert len(result.candidates) == 1 and result.candidates[0].label == "Iago"
+    assert result.candidates[0].confidence is None and not result.execution_authorized
+    screenshot.discard()
+
+
+def test_openai_activation_verification_uses_structured_activity_evidence() -> None:
+    item = element(label="Iago", role="list_item", parent="")
+    item.pop("parent")
+    item["activity"] = "active"
+    provider, transport = observer(response([item]))
+    screenshot = capture()
+    grounding = VisualGroundingRequest(
+        'Verify whether "Iago" is the currently active conversation.', 5,
+        verification_only=True,
+    )
+
+    result = provider.observe(screenshot, Observation("app", "Window"), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["input"][0]["content"][0]["text"]
+    schema = payload["text"]["format"]["schema"]["properties"]["elements"]["items"]
+    assert "currently active, opened, or selected" in prompt
+    assert schema["properties"]["activity"]["enum"] == ["active", "not_active", "unknown"]
+    assert "activity" in schema["required"]
+    assert "parent" not in schema["properties"]
+    assert result.candidates[0].activity == "active"
+    assert result.execution_authorized is False
+    screenshot.discard()
+
+
+def test_openai_http_diagnostics_expose_only_safe_allowlisted_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+    import json as json_module
+    import urllib.error
+    from email.message import Message
+
+    secret = "sk-secret-provider-body-value"
+    headers = Message()
+    headers["x-request-id"] = "req_safe-123"
+    body = json_module.dumps({
+        "error": {"type": "authentication_error", "code": "invalid_api_key", "message": secret},
+    }).encode()
+    failure = urllib.error.HTTPError(
+        "https://api.openai.com/v1/responses", 401, "Unauthorized", headers, io.BytesIO(body),
+    )
+    monkeypatch.setattr(
+        "computer.visual_providers.common.urllib.request.urlopen", Mock(side_effect=failure),
+    )
+    provider = OpenAIVisualObserver("api-secret", transport=None)
+    screenshot = capture()
+
+    with pytest.raises(VisualProviderFailure) as caught:
+        provider.observe(screenshot, Observation("", ""), "inspect")
+
+    diagnostic = caught.value.diagnostic
+    safe = json.dumps(diagnostic.__dict__ if hasattr(diagnostic, "__dict__") else {
+        field: getattr(diagnostic, field) for field in diagnostic.__dataclass_fields__
+    })
+    assert diagnostic.http_status == 401
+    assert diagnostic.provider_code == "invalid_api_key"
+    assert diagnostic.provider_status_code == 401
+    assert diagnostic.provider_error_code == "invalid_api_key"
+    assert diagnostic.provider_error_type == "authentication_error"
+    assert diagnostic.provider_request_id == "req_safe-123"
+    assert secret not in safe and "api-secret" not in safe
     screenshot.discard()
 
 

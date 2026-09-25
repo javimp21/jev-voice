@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+import math
 import time
-from typing import Any
+from typing import Any, Literal
 
 from computer.actions import (
     Action, ClickAction, FinishAction, OpenAppAction, PressKeyAction, QuerySubmitAction,
     TypeAction, VisualClickAction,
 )
-from computer.applications import ApplicationCatalog
-from computer.models import Observation, Rect
-from computer.results import ActionResult, LiteralInputDiagnostic
-from computer.windows import ObservationOptions, WindowsObserver, _foreground
+from computer.applications import (
+    ApplicationCandidate, ApplicationCatalog, TrustedApplicationRuntimeState,
+    TrustedWindowActivationResult,
+)
+from computer.models import (
+    Observation, ProviderErrorDiagnostic, Rect, VisualGroundingStatus,
+    VisualPipelineDiagnostic, VisualProviderAttempt,
+)
+from computer.results import ActionResult, LiteralInputDiagnostic, VisualActivationDiagnostic
+from computer.windows import (
+    ObservationOptions, WindowsObserver, _foreground, _redact_observed_text,
+)
 from computer.visual import (
-    ScreenCapture, VisualGroundingRequest, VisualObserver, VisualReadinessOptions,
+    ScreenCapture, ScreenshotCapture, VisualGroundingRequest, VisualObserver,
+    VisualProviderFailure, VisualReadinessOptions,
+    validate_visual_candidates_detailed,
     visual_click_point, visual_readiness_frame, visual_rect_to_screen,
 )
 from safety.interfaces import ActionPolicy
@@ -68,6 +80,113 @@ def _send_key(keys: tuple[str, ...]) -> None:
 def _click_point(x: int, y: int) -> None:
     from pywinauto.mouse import click
     click(button="left", coords=(x, y))
+
+
+@dataclass(slots=True)
+class _VisualActivationProgress:
+    diagnostic: VisualActivationDiagnostic
+    stage: str = "snapshot_lookup"
+
+    def update(self, **changes: object) -> None:
+        from dataclasses import replace
+        self.diagnostic = replace(self.diagnostic, **changes)
+
+    def fail(self, stage: str, reason: str) -> None:
+        self.stage = stage
+        changes: dict[str, object] = dict(
+            failure_stage=stage,
+            failure_reason=reason,
+            input_result=("failed_or_unknown" if self.diagnostic.input_attempted
+                          else "not_attempted"),
+        )
+        if not self.diagnostic.preflight_succeeded:
+            changes["preflight_failure_reason"] = reason
+        self.update(**changes)
+
+
+def _visual_provider_diagnostic_name(
+    value: str | None,
+) -> Literal["openai", "gemini", "other", "unknown"]:
+    if value in {"openai", "gemini"}:
+        return value
+    return "other" if value else "unknown"
+
+
+_ACTIONABLE_CONTROL_TYPES = frozenset({
+    "Button", "CheckBox", "ComboBox", "Hyperlink", "ListItem", "MenuItem",
+    "RadioButton", "TabItem", "TreeItem",
+})
+
+
+def _geometry_bucket(value: float, *, first: float, second: float) -> str:
+    if value <= first:
+        return "small"
+    if value <= second:
+        return "medium"
+    return "large"
+
+
+def _visual_click_geometry_diagnostics(
+    observation: Observation, element, metadata, screen_rect: Rect, point: tuple[int, int],
+) -> dict[str, object]:
+    width = max(1, metadata.pixel_width)
+    height = max(1, metadata.pixel_height)
+    box_width = max(0, element.rectangle.right - element.rectangle.left)
+    box_height = max(0, element.rectangle.bottom - element.rectangle.top)
+    relative_x = (point[0] - screen_rect.left) / max(1, screen_rect.right - screen_rect.left)
+    relative_y = (point[1] - screen_rect.top) / max(1, screen_rect.bottom - screen_rect.top)
+
+    def relative_bucket(value: float) -> str:
+        if value < .34:
+            return "near_start"
+        if value > .66:
+            return "near_end"
+        return "center"
+
+    window = metadata.window_bounds
+    inside_window = (
+        window.left <= screen_rect.left and window.top <= screen_rect.top
+        and screen_rect.right <= window.right and screen_rect.bottom <= window.bottom
+    )
+    ratio = box_width / max(1, box_height)
+    aspect = "wide" if ratio >= 1.6 else "tall" if ratio <= .625 else "balanced"
+    neighbors: list[Rect] = []
+    for control in observation.elements:
+        if (control.visible is True and control.enabled is True
+                and control.control_type in _ACTIONABLE_CONTROL_TYPES
+                and isinstance(control.rectangle, Rect)):
+            neighbors.append(control.rectangle)
+    for visual in observation.visual_elements:
+        if visual.id == element.id or visual.clickable is not True:
+            continue
+        try:
+            neighbors.append(visual_rect_to_screen(visual.rectangle, metadata))
+        except Exception:
+            continue
+
+    distances: list[float] = []
+    overlap = False
+    for neighbor in neighbors:
+        dx = max(screen_rect.left - neighbor.right, neighbor.left - screen_rect.right, 0)
+        dy = max(screen_rect.top - neighbor.bottom, neighbor.top - screen_rect.bottom, 0)
+        if dx == 0 and dy == 0:
+            overlap = True
+        distances.append(math.hypot(dx, dy))
+    nearest = min(distances) if distances else None
+    distance_bucket = (
+        None if nearest is None else "overlap" if nearest == 0 else
+        "touching" if nearest <= 6 else "near" if nearest <= 24 else
+        "moderate" if nearest <= 80 else "far"
+    )
+    return {
+        "normalized_box_width_bucket": _geometry_bucket(box_width / width, first=.10, second=.30),
+        "normalized_box_height_bucket": _geometry_bucket(box_height / height, first=.08, second=.20),
+        "click_point_relative_bucket": f"{relative_bucket(relative_x)}:{relative_bucket(relative_y)}",
+        "candidate_box_inside_bound_window": inside_window,
+        "candidate_box_aspect_bucket": aspect,
+        "overlaps_actionable_candidate": overlap,
+        "nearest_actionable_neighbor_distance_bucket": distance_bucket,
+    }
 
 
 import ctypes
@@ -222,6 +341,7 @@ class WindowsComputer(WindowsObserver):
         self.app_catalog = app_catalog
         self.visual_min_confidence = visual_min_confidence
         self._session: _Session | None = None
+        self._activation_probe = None
 
     def observe(self) -> Observation:
         self._session = None
@@ -272,6 +392,29 @@ class WindowsComputer(WindowsObserver):
             self.visual_provider = provider
             self.visual_grounding = grounding
 
+    def activation_target_probe(
+        self, candidate: ApplicationCandidate,
+    ) -> Callable[[], TrustedApplicationRuntimeState] | None:
+        """Bind a fresh, catalog-scoped probe to one trusted OpenApp candidate."""
+        self._activation_probe = None
+        if self.app_catalog is None:
+            return None
+        from computer.windows_activation import WindowsTrustedApplicationProbe
+
+        self._activation_probe = WindowsTrustedApplicationProbe(self.app_catalog, candidate)
+        return self._activation_probe
+
+    def activate_trusted_application_window(
+        self, candidate: ApplicationCandidate,
+    ) -> TrustedWindowActivationResult:
+        """Request activation of the probe's already verified window, never an HWND."""
+        probe = self._activation_probe
+        if probe is None:
+            return TrustedWindowActivationResult(
+                False, "probe_incomplete", failure_reason="trusted_window_probe_unavailable",
+            )
+        return probe.activate(candidate)
+
     def observe_directed(self, grounding: VisualGroundingRequest) -> Observation:
         """Create a fresh directed hybrid snapshot with normal local bindings."""
         if self.visual_provider is None:
@@ -282,6 +425,149 @@ class WindowsComputer(WindowsObserver):
             return self.observe()
         finally:
             self.visual_grounding = previous
+
+    def activation_postcondition_context_matches(
+        self, before: Observation, after: Observation,
+    ) -> bool:
+        """Require the fresh local observation to remain bound to the same trusted HWND."""
+        session = self._session
+        before_hwnd = (
+            before.foreground_hwnd
+            or (before.screenshot.window_handle if before.screenshot is not None else None)
+        )
+        after_hwnd = (
+            after.foreground_hwnd
+            or (after.screenshot.window_handle if after.screenshot is not None else None)
+        )
+        if (session is None or session.observation is not after or before_hwnd is None
+                or after_hwnd is None or before_hwnd != session.handle
+                or after_hwnd != session.handle
+                or before.application_id != after.application_id
+                or before.process_id != after.process_id):
+            return False
+        try:
+            self._check_window(session)
+        except Exception:
+            return False
+        return session.root.identity.process_id == after.process_id
+
+    def verify_activation_postcondition_visual(
+        self, observation: Observation, grounding: VisualGroundingRequest,
+    ) -> Observation:
+        """Ground one masked fresh capture without another UIA traversal."""
+        session = self._session
+        provider = self.visual_provider
+        capture: ScreenshotCapture | None = None
+
+        def failed(code: str, provider_error: ProviderErrorDiagnostic | None = None,
+                   attempts=(), *, failover_used: bool = False,
+                   failover_reason: str | None = None) -> Observation:
+            return replace(
+                observation,
+                visual_provider=(provider_error.provider_name if provider_error else None),
+                visual_provider_error=provider_error or ProviderErrorDiagnostic(
+                    code, message="Post-activation visual verification could not be completed.",
+                ),
+                visual_provider_attempts=tuple(attempts)[:4],
+                selected_visual_provider=None,
+                provider_failover_used=failover_used,
+                provider_failover_reason=failover_reason,
+                visual_directed_grounding=True,
+                visual_grounding_status=VisualGroundingStatus.PROVIDER_ERROR,
+                visual_provider_call_count=len(tuple(attempts)),
+                visual_execution_authorized=False,
+            )
+
+        if (session is None or session.observation is not observation
+                or provider is None or self.capture_service is None):
+            return failed("capture_unavailable")
+        if _redact_observed_text(grounding.objective) != grounding.objective:
+            return failed("unsafe_grounding_objective")
+        try:
+            self._check_window(session)
+            sensitive = tuple(
+                control.rectangle for control in observation.elements
+                if control.is_password is True and isinstance(control.rectangle, Rect)
+            )
+            capture = self.capture_service.capture(
+                observation.observation_id, session.handle, observation.app_name, sensitive,
+            )
+            if (capture.metadata.snapshot_id != observation.observation_id
+                    or capture.metadata.window_handle != session.handle
+                    or capture.metadata.window_bounds
+                    != self.capture_service.current_window_bounds(session.handle)):
+                return failed("capture_context_changed")
+            self._check_window(session)
+            started = time.monotonic()
+            visual = provider.observe(capture, observation, grounding.objective, grounding)
+            if visual.execution_authorized:
+                return failed("invalid_response")
+
+            class _Redactor:
+                @staticmethod
+                def clean(value: str) -> str:
+                    return _redact_observed_text(value)
+
+            validated, rejected = validate_visual_candidates_detailed(
+                visual.candidates, capture.metadata, max_elements=grounding.max_elements,
+                redactor=_Redactor(),
+            )
+            attempts = visual.provider_attempts
+            if not attempts:
+                attempts = (VisualProviderAttempt(
+                    visual.provider[:40], visual.model[:100],
+                    max(0, visual.latency_ms or 0),
+                    "success_with_candidates" if validated else "success_empty",
+                ),)
+            status = (
+                VisualGroundingStatus.SUCCESS_WITH_CANDIDATES if validated
+                else VisualGroundingStatus.SUCCESS_EMPTY
+            )
+            return replace(
+                observation,
+                screenshot=capture.metadata,
+                capture_diagnostics=capture.diagnostics,
+                visual_elements=validated,
+                visual_provider=visual.provider[:80],
+                visual_model=visual.model[:100] or None,
+                visual_latency_ms=max(0, visual.latency_ms or 0),
+                visual_usage=visual.usage,
+                visual_pricing_class=visual.pricing_class[:40],
+                visual_execution_authorized=False,
+                visual_provider_error=None,
+                visual_provider_attempts=attempts[:4],
+                selected_visual_provider=visual.provider[:80],
+                provider_failover_used=visual.provider_failover_used,
+                provider_failover_reason=visual.provider_failover_reason,
+                screenshot_capture_ms=max(0, round((time.monotonic() - started) * 1000)),
+                visual_requested_max_elements=grounding.max_elements,
+                visual_returned_elements=len(validated),
+                visual_directed_grounding=True,
+                visual_grounding_status=status,
+                visual_pipeline=VisualPipelineDiagnostic(
+                    provider_requested_max_elements=grounding.max_elements,
+                    provider_raw_element_count=visual.raw_element_count,
+                    parsed_element_count=visual.parsed_element_count,
+                    validated_element_count=len(validated),
+                    deduplicated_element_count=len(validated),
+                    observation_visual_control_count=len(validated),
+                ),
+                visual_rejection_summary=tuple(sorted(rejected.items())),
+                visual_provider_call_count=max(1, len(attempts)),
+            )
+        except KeyboardInterrupt:
+            raise
+        except VisualProviderFailure as exc:
+            return failed(
+                exc.code, exc.diagnostic, exc.provider_attempts,
+                failover_used=exc.provider_failover_used,
+                failover_reason=exc.provider_failover_reason,
+            )
+        except Exception:
+            return failed("unknown_api_error")
+        finally:
+            if capture is not None:
+                capture.discard()
 
     def observe_result_baseline(self) -> Observation:
         """Capture one masked post-type/pre-submit baseline without a provider call."""
@@ -439,31 +725,61 @@ class WindowsComputer(WindowsObserver):
     def _execute_visual_click(
         self, action: VisualClickAction, observation: Observation, session: _Session,
         *, require_phase1_geometry: bool,
+        diagnostic_progress: _VisualActivationProgress | None = None,
     ) -> ActionResult:
         metadata = observation.screenshot
         element = next((item for item in observation.visual_elements
                         if item.id == action.target_id), None)
+        if diagnostic_progress is not None:
+            diagnostic_progress.update(
+                candidate_lookup_succeeded=element is not None,
+                provenance_valid=(element.source == "visual" if element is not None else False),
+            )
         if metadata is None or element is None:
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("snapshot_lookup", "target_or_capture_metadata_unavailable")
             raise UnsafeTarget("Visual target or capture metadata is unavailable.")
         if (metadata.snapshot_id != action.snapshot_id
                 or action.snapshot_id != observation.observation_id):
+            if diagnostic_progress is not None:
+                diagnostic_progress.update(snapshot_binding_valid=False)
+                diagnostic_progress.fail("snapshot_binding", "snapshot_id_mismatch")
             raise StaleObservation("Visual target belongs to a different snapshot; observe again.")
+        if diagnostic_progress is not None:
+            diagnostic_progress.update(snapshot_binding_valid=True)
         if metadata.window_handle != session.handle:
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("window_binding", "capture_window_mismatch")
             raise StaleObservation("Visual capture belongs to a different window.")
         if self.capture_service is None:
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("geometry_preflight", "capture_geometry_service_unavailable")
             raise UnsafeTarget("No screen-capture geometry service is configured.")
+        if diagnostic_progress is not None:
+            diagnostic_progress.stage = "foreground_preflight"
+            diagnostic_progress.update(foreground_stable_before_input=False)
         self._check_window(session)
+        if diagnostic_progress is not None:
+            diagnostic_progress.stage = "window_geometry_preflight"
         current_bounds = self.capture_service.current_window_bounds(session.handle)
         if current_bounds != metadata.window_bounds:
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("window_geometry_preflight", "window_bounds_changed")
             raise StaleObservation("Window moved or resized; observe again.")
         virtual_bounds = None
         if require_phase1_geometry:
             diagnostics = observation.capture_diagnostics
             current_virtual = getattr(self.capture_service, "current_virtual_screen_bounds", None)
             if diagnostics is None or not callable(current_virtual):
+                if diagnostic_progress is not None:
+                    diagnostic_progress.fail("capture_geometry_preflight", "capture_context_unavailable")
                 raise UnsafeTarget("Phase-1 capture context is unavailable.")
+            if diagnostic_progress is not None:
+                diagnostic_progress.stage = "virtual_screen_preflight"
             virtual_bounds = current_virtual()
             if virtual_bounds != diagnostics.virtual_screen_bounds:
+                if diagnostic_progress is not None:
+                    diagnostic_progress.fail("virtual_screen_preflight", "virtual_screen_bounds_changed")
                 raise StaleObservation("Virtual desktop geometry changed; observe again.")
             expected_capture = Rect(
                 max(current_bounds.left, virtual_bounds.left),
@@ -472,29 +788,83 @@ class WindowsComputer(WindowsObserver):
                 min(current_bounds.bottom, virtual_bounds.bottom),
             )
             if expected_capture != metadata.capture_bounds:
+                if diagnostic_progress is not None:
+                    diagnostic_progress.fail("capture_geometry_preflight", "capture_bounds_changed")
                 raise StaleObservation("Capture bounds changed; observe again.")
+        if diagnostic_progress is not None:
+            diagnostic_progress.stage = "coordinate_resolution"
         screen_rect = visual_rect_to_screen(element.rectangle, metadata)
         bounds = metadata.capture_bounds
         if (screen_rect.left < bounds.left or screen_rect.top < bounds.top
                 or screen_rect.right > bounds.right or screen_rect.bottom > bounds.bottom
                 or screen_rect.right <= screen_rect.left or screen_rect.bottom <= screen_rect.top):
+            if diagnostic_progress is not None:
+                diagnostic_progress.update(geometry_resolution_succeeded=True)
+                diagnostic_progress.fail("coordinate_validation", "candidate_outside_capture_bounds")
             raise UnsafeTarget("Visual target lies outside the captured foreground window.")
         point = visual_click_point(element, metadata)
-        if not (screen_rect.left <= point[0] < screen_rect.right
-                and screen_rect.top <= point[1] < screen_rect.bottom
-                and bounds.left <= point[0] < bounds.right
-                and bounds.top <= point[1] < bounds.bottom):
+        if diagnostic_progress is not None:
+            diagnostic_progress.update(**_visual_click_geometry_diagnostics(
+                observation, element, metadata, screen_rect, point,
+            ))
+        inside_candidate = (
+            screen_rect.left <= point[0] < screen_rect.right
+            and screen_rect.top <= point[1] < screen_rect.bottom
+        )
+        inside_capture = (
+            bounds.left <= point[0] < bounds.right
+            and bounds.top <= point[1] < bounds.bottom
+        )
+        window_bounds = metadata.window_bounds
+        inside_window = (
+            window_bounds.left <= point[0] < window_bounds.right
+            and window_bounds.top <= point[1] < window_bounds.bottom
+        )
+        if diagnostic_progress is not None:
+            diagnostic_progress.update(
+                geometry_resolution_succeeded=True,
+                resolved_point_inside_candidate=inside_candidate,
+                resolved_point_inside_bound_window=inside_window,
+            )
+        if not (inside_candidate and inside_capture and inside_window):
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("coordinate_validation", "resolved_point_outside_validated_bounds")
             raise UnsafeTarget("Visual click point is invalid.")
         if virtual_bounds is not None and not (
             virtual_bounds.left <= point[0] < virtual_bounds.right
             and virtual_bounds.top <= point[1] < virtual_bounds.bottom
         ):
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("coordinate_validation", "resolved_point_outside_virtual_desktop")
             raise UnsafeTarget("Visual click point is outside the virtual desktop.")
+        if diagnostic_progress is not None:
+            diagnostic_progress.stage = "foreground_revalidation"
+            diagnostic_progress.update(foreground_stable_before_input=False)
         self._check_window(session)
-        _click_point(*point)
+        if diagnostic_progress is not None:
+            diagnostic_progress.stage = "os_mouse_input"
+            diagnostic_progress.update(
+                foreground_stable_before_input=True,
+                preflight_succeeded=True,
+                preflight_failure_reason=None,
+                input_attempted=True,
+            )
+        try:
+            _click_point(*point)
+        except Exception:
+            if diagnostic_progress is not None:
+                diagnostic_progress.fail("os_mouse_input", "mouse_input_failed_or_unknown")
+            raise
+        if diagnostic_progress is not None:
+            diagnostic_progress.update(
+                input_result="succeeded", failure_stage=None, failure_reason=None,
+            )
         return ActionResult(
             True, action, "One validated visual target click performed.",
             source_observation_id=observation.observation_id, input_issued=True,
+            visual_activation_diagnostic=(
+                diagnostic_progress.diagnostic if diagnostic_progress is not None else None
+            ),
         )
 
     def execute_visual_click_phase1(
@@ -547,22 +917,95 @@ class WindowsComputer(WindowsObserver):
         """Execute one generic visual target with the bounded generic safety gate."""
         session = self._session
         self._session = None
+        candidate_id = action.target_id
+        if (not isinstance(candidate_id, str) or len(candidate_id) > 6
+                or not candidate_id.startswith("v") or not candidate_id[1:].isdigit()):
+            candidate_id = None
+        observed_candidate = next((
+            item for item in observation.visual_elements if item.id == action.target_id
+        ), None)
+        progress = _VisualActivationProgress(VisualActivationDiagnostic(
+            candidate_id=candidate_id,
+            snapshot_binding_valid=(
+                observation.screenshot is not None
+                and action.snapshot_id == observation.observation_id
+                and observation.screenshot.snapshot_id == action.snapshot_id
+            ),
+            candidate_lookup_succeeded=observed_candidate is not None,
+            provenance_valid=(
+                observed_candidate.source == "visual" if observed_candidate is not None else False
+            ),
+            provider_name=_visual_provider_diagnostic_name(observation.visual_provider),
+            snapshot_consumed=True,
+            preflight_started=True,
+        ))
         try:
+            progress.stage = "safety_policy"
             verdict = GenericTargetActivationPolicy(self.app_catalog).validate_candidate(
                 action, observation,
             )
             if verdict.disposition != "allow":
-                return ActionResult(False, action, verdict.reason, error="policy_blocked")
+                progress.fail("safety_policy", "local_safety_policy_rejected")
+                return ActionResult(
+                    False, action, verdict.reason, error="policy_blocked",
+                    visual_activation_diagnostic=progress.diagnostic,
+                )
             if session is None or observation is not session.observation:
+                progress.update(snapshot_binding_valid=False)
+                progress.fail("snapshot_binding", "observation_not_current_bound_session")
                 raise UnsafeTarget("Missing, foreign, copied, consumed, or superseded observation.")
-            return self._execute_visual_click(action, observation, session, require_phase1_geometry=True)
+            progress.update(snapshot_binding_valid=True)
+            return self._execute_visual_click(
+                action, observation, session, require_phase1_geometry=True,
+                diagnostic_progress=progress,
+            )
         except StaleObservation as exc:
-            return ActionResult(False, action, str(exc), error="stale_observation")
+            if progress.diagnostic.failure_reason is None:
+                stage = progress.stage
+                reason = {
+                    "snapshot_binding": "snapshot_not_current_or_superseded",
+                    "window_binding": "capture_window_mismatch",
+                    "foreground_preflight": "foreground_or_trusted_window_changed",
+                    "window_geometry_preflight": "window_bounds_changed",
+                    "virtual_screen_preflight": "virtual_screen_bounds_changed",
+                    "capture_geometry_preflight": "capture_bounds_changed",
+                    "foreground_revalidation": "foreground_or_trusted_window_changed",
+                }.get(stage, "stale_visual_snapshot")
+                progress.fail(stage, reason)
+            return ActionResult(
+                False, action, str(exc), error="stale_observation",
+                visual_activation_diagnostic=progress.diagnostic,
+            )
         except UnsafeTarget as exc:
-            return ActionResult(False, action, str(exc), error="unsafe_target")
+            if progress.diagnostic.failure_reason is None:
+                stage = progress.stage
+                reason = {
+                    "snapshot_lookup": "target_or_capture_metadata_unavailable",
+                    "safety_policy": "local_safety_policy_rejected",
+                    "geometry_preflight": "capture_geometry_service_unavailable",
+                    "capture_geometry_preflight": "capture_context_unavailable",
+                    "foreground_preflight": "foreground_or_trusted_window_changed",
+                    "foreground_revalidation": "foreground_or_trusted_window_changed",
+                    "coordinate_validation": "visual_geometry_rejected",
+                }.get(stage, "local_safety_check_failed")
+                progress.fail(stage, reason)
+            return ActionResult(
+                False, action, str(exc), error="unsafe_target",
+                visual_activation_diagnostic=progress.diagnostic,
+            )
         except Exception:
+            if progress.diagnostic.failure_reason is None:
+                stage = progress.stage
+                reason = {
+                    "coordinate_resolution": "coordinate_resolution_failed",
+                    "window_geometry_preflight": "window_geometry_service_failed",
+                    "virtual_screen_preflight": "virtual_screen_geometry_service_failed",
+                    "os_mouse_input": "mouse_input_failed_or_unknown",
+                }.get(stage, "visual_executor_failed")
+                progress.fail(stage, reason)
             return ActionResult(False, action, "Generic visual target activation failed.",
-                                error="windows_operation_failed", input_issued=False)
+                                error="windows_operation_failed", input_issued=False,
+                                visual_activation_diagnostic=progress.diagnostic)
     def execute_type_phase2(
         self, action: TypeAction, observation: Observation, *, visual_verified: bool,
     ) -> ActionResult:

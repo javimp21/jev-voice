@@ -1,20 +1,17 @@
-"""Recording and transcription are independent responsibilities."""
+"""Provider-independent contracts for one-shot voice input."""
 
-from pathlib import Path
 from typing import Protocol
+
+from voice.models import AudioCaptureResult, SpeechTranscript
 
 
 class Microphone(Protocol):
-    def record(self) -> Path:
-        """Record one utterance to a local audio file and return its path.
-
-        The eventual caller owns deletion; format and stop behavior remain
-        adapter decisions. No recording is implemented at this stage.
-        """
+    def record(self) -> AudioCaptureResult:
+        """Record one bounded utterance and return it in memory."""
         ...
 
 
 class SpeechToText(Protocol):
-    def transcribe(self, recording: Path) -> str:
-        """Convert a recorded utterance into the user's request."""
+    def transcribe(self, audio: AudioCaptureResult) -> SpeechTranscript:
+        """Convert one utterance into a transcript without rewriting it."""
         ...

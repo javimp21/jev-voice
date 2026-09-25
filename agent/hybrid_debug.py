@@ -11,6 +11,9 @@ import unicodedata
 
 from agent.application_activation import wait_for_trusted_application_activation
 from agent.loop import AgentLimits, _RepeatGuard
+from agent.visual_field_verification import (
+    has_credential_sensitive_evidence, verify_visual_field_correspondence,
+)
 from computer.actions import (
     Action, FinishAction, OpenAppAction, QuerySubmitAction, TypeAction, VisualClickAction,
 )
@@ -32,7 +35,7 @@ from decision.models import (
 )
 from decision.target_resolution import (
     CandidateEvidence, TargetResolution, TargetResolutionStatus, TargetSpec,
-    canonical_semantic_role, resolve_target,
+    canonical_semantic_role, normalize_presentation_role, resolve_target,
 )
 from safety.interfaces import ActionPolicy, Confirmation
 from safety.policy import BasicActionPolicy
@@ -73,6 +76,8 @@ def _phase3_candidate_evidence(
             safety_eligible=safety_eligible,
             source=item.source[:40],
             snapshot_id=observation.observation_id,
+            target_semantic_evidence=canonical_semantic_role(redactor.clean(item.role)[:80]),
+            presentation_role=normalize_presentation_role(redactor.clean(item.role)[:80]),
         ))
         retained_ids.add(item.id)
 
@@ -95,6 +100,8 @@ def _phase3_candidate_evidence(
             safety_eligible=False,
             source="visual",
             snapshot_id=observation.observation_id,
+            target_semantic_evidence=canonical_semantic_role(redactor.clean(item.role)[:80]),
+            presentation_role=normalize_presentation_role(redactor.clean(item.role)[:80]),
         ))
         retained_ids.add(candidate_id)
     return tuple(result)
@@ -439,24 +446,6 @@ class HybridDebugAgent:
             return ObservationPolicyDiagnostic(False, "unsafe_grounding_objective")
         return ObservationPolicyDiagnostic(True, "bounded_observation_allowed", False)
 
-    @staticmethod
-    def _visual_targets_consistent(
-        prior, current, prior_observation: Observation, current_observation: Observation,
-    ) -> bool:
-        first_meta, second_meta = prior_observation.screenshot, current_observation.screenshot
-        if first_meta is None or second_meta is None:
-            return False
-        def normalized(rect, width, height):
-            return (rect.left / width, rect.top / height, rect.right / width, rect.bottom / height)
-        first = normalized(prior.rectangle, first_meta.pixel_width, first_meta.pixel_height)
-        second = normalized(current.rectangle, second_meta.pixel_width, second_meta.pixel_height)
-        width = max(0.0, min(first[2], second[2]) - max(first[0], second[0]))
-        height = max(0.0, min(first[3], second[3]) - max(first[1], second[1]))
-        intersection = width * height
-        first_area = (first[2] - first[0]) * (first[3] - first[1])
-        second_area = (second[2] - second[0]) * (second[3] - second[1])
-        return min(first_area, second_area) > 0 and intersection / min(first_area, second_area) >= .5
-
     def _run_phase2_type(
         self, request: str, clicked_observation: Observation, clicked_target,
         post_click: Observation,
@@ -471,13 +460,21 @@ class HybridDebugAgent:
                 base, type_readiness=readiness,
             ), None
         context_match = self.computer.visual_context_matches(clicked_observation)
+        if has_credential_sensitive_evidence(
+            request, clicked_target, clicked_observation, post_click,
+        ):
+            readiness = PostClickTypeReadiness(False, "insufficient", False, context_match, False)
+            return False, "visual_type_safety_denied", "Credential-sensitive context.", replace(
+                base, type_readiness=readiness,
+            ), post_click
         focused = next((control for control in post_click.elements
                         if control.focused is True and control.enabled is True
                         and control.control_type in {"Edit", "Document"}
                         and control.is_password is False), None)
         type_observation = post_click
         visual_verified = False
-        if focused is not None and context_match:
+        if (focused is not None and context_match
+                and self.computer.visual_context_matches(clicked_observation)):
             readiness = PostClickTypeReadiness(True, "strong_local", False, True, True)
         else:
             try:
@@ -495,28 +492,24 @@ class HybridDebugAgent:
                 return False, "visual_type_readiness_insufficient", (
                     "Visual typing readiness could not be established."
                 ), replace(base, type_readiness=readiness), verification
+            correspondence = verify_visual_field_correspondence(
+                clicked_target, clicked_observation, verification,
+            )
             same_context = (
-                verification.observation_id != clicked_observation.observation_id
-                and verification.screenshot is not None
-                and clicked_observation.screenshot is not None
-                and verification.screenshot.window_handle
-                == clicked_observation.screenshot.window_handle
-                and verification.process_id == clicked_observation.process_id
-                and verification.screenshot.window_bounds
-                == clicked_observation.screenshot.window_bounds
-                and verification.screenshot.capture_bounds
-                == clicked_observation.screenshot.capture_bounds
+                correspondence.window_geometry_stable
                 and self.computer.visual_context_matches(clicked_observation)
             )
-            roles = {"edit", "text field", "text_field", "search field", "search_field"}
-            matched = next((candidate for candidate in verification.visual_elements
-                            if candidate.clickable and candidate.role.casefold() in roles
-                            and self._visual_targets_consistent(
-                                clicked_target, candidate, clicked_observation, verification,
-                            )), None)
-            if not same_context or matched is None:
+            if has_credential_sensitive_evidence(
+                request, clicked_target, verification,
+            ):
+                readiness = PostClickTypeReadiness(False, "insufficient", True, same_context, False)
+                return False, "visual_type_safety_denied", "Credential-sensitive context.", replace(
+                    base, type_readiness=readiness,
+                ), verification
+            if not same_context or not correspondence.verified:
                 readiness = PostClickTypeReadiness(
-                    False, "insufficient", True, same_context, matched is not None,
+                    False, "insufficient", True, same_context,
+                    correspondence.spatial_correspondence_result == "unique_match",
                 )
                 return False, "visual_type_readiness_insufficient", (
                     "Visual verification did not match the clicked input field."

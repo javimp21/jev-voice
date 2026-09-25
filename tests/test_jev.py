@@ -84,6 +84,8 @@ def test_target_activation_jev_receives_only_the_bounded_semantic_frontier() -> 
     criteria = payload["questions"]["next_action"]["criteria"]
     assert set(criteria) == {"target_1", "target_2", "stop"}
     assert {criteria[key]["candidate_id"] for key in ("target_1", "target_2")} == {"c1", "c2"}
+    assert criteria["target_1"]["target_semantic_evidence"] == "conversation"
+    assert criteria["target_1"]["presentation_role"] == "list_item"
     serialized = json.dumps(payload).casefold()
     for forbidden in ("screenshot", "coordinates", "hwnd", "process_id", "automation_id"):
         assert forbidden not in serialized
@@ -96,10 +98,34 @@ def test_target_activation_jev_rejects_unoffered_choice_and_low_confidence() -> 
 
     bad = decision.decide_target_activation(target, resolution)
     assert bad.status == "error" and bad.error == "invalid_response"
+    assert bad.diagnostic_reason == "invalid_response" and bad.provider_called is True
 
     low, _ = maker("target_1", confidence=.79)
     stopped = low.decide_target_activation(target, resolution)
     assert stopped.status == "stop" and stopped.candidate_id is None
+    assert stopped.diagnostic_reason == "model_confidence_below_threshold"
+    assert stopped.provider_called is True
+    assert stopped.proposed_candidate_id == "c1"
+
+    explicit_stop, _ = maker("stop", confidence=.95)
+    stopped = explicit_stop.decide_target_activation(target, resolution)
+    assert stopped.status == "stop" and stopped.diagnostic_reason == "model_stop"
+    assert stopped.provider_called is True
+    assert stopped.proposed_candidate_id is None
+
+
+def test_target_activation_jev_provider_failure_is_bounded() -> None:
+    target, resolution = _target_choice_resolution()
+    decision, client = maker("target_1")
+    client.evaluate.side_effect = APIError(
+        "private provider detail", category="timeout", http_status=408,
+    )
+
+    result = decision.decide_target_activation(target, resolution)
+
+    assert result.status == "error" and result.error == "timeout"
+    assert result.diagnostic_reason == "provider_error" and result.provider_called is True
+    assert "private provider detail" not in repr(result)
 
 
 def test_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -467,7 +493,10 @@ def test_decide_cli_never_constructs_executor(
     executor.assert_not_called()
 
 
-def test_cli_configuration_error_before_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_configuration_error_before_observation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path,
+) -> None:
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "main.py"))
     monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
     monkeypatch.delenv("JEV_MIN_CONFIDENCE", raising=False)
     observer = Mock(side_effect=AssertionError("should validate configuration first"))

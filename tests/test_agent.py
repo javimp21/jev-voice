@@ -86,6 +86,27 @@ def test_successful_loop_uses_fresh_observations_and_history() -> None:
     assert decision.calls[2][2][-1].action == type_action
 
 
+def test_standard_run_agent_does_not_call_generic_window_activation_hook() -> None:
+    open_action = OpenAppAction(APP_ID)
+    computer = FakeComputer([_observation("before"), _observation("after")])
+    calls: list[str] = []
+    computer.activation_target_probe = lambda _candidate: calls.append("probe")
+    computer.activate_trusted_application_window = lambda _candidate: calls.append("activate")
+    decision = ScriptedDecision([_ready(open_action), _ready(FinishAction("done"))])
+    catalog = MemoryApplicationCatalog((
+        ApplicationCandidate(APP_ID, "Notepad", "test", launch_policy="allow"),
+    ))
+
+    result = Agent(
+        computer, decision, policy=BasicActionPolicy(catalog),
+        limits=AgentLimits(settle_open_seconds=0),
+    ).run("Open Notepad")
+
+    assert result.success
+    assert calls == []
+    assert [item[0] for item in computer.executed] == [open_action]
+
+
 def test_visual_click_is_followed_by_a_fresh_observation() -> None:
     metadata = ScreenshotMetadata(
         "visual-one", 1, Rect(0, 0, 100, 100), Rect(0, 0, 100, 100),

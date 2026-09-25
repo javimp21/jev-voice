@@ -12,12 +12,14 @@ from computer.visual import (
     ScreenshotCapture, VisualGroundingRequest, VisualObservation, VisualProviderFailure,
 )
 from computer.visual_providers.common import (
-    HTTPSJSONTransport, JSONTransport, candidate_from_normalized, png_data_url,
-    strict_visual_json, token_usage, visual_prompt, visual_schema,
+    HTTPSJSONTransport, JSONTransport, candidate_from_normalized, directed_visual_prompt,
+    png_data_url, strict_visual_json, token_usage, visual_prompt, visual_schema,
 )
 
 
 _ENDPOINT = "https://api.openai.com/v1/responses"
+OPENAI_VISUAL_MODEL = "gpt-5.6-luna"
+OPENAI_DIRECTED_MAX_OUTPUT_TOKENS = 800
 
 
 def _output_text(response: dict[str, Any]) -> str:
@@ -70,39 +72,77 @@ class OpenAIVisualObserver:
         self, screenshot: ScreenshotCapture, window: Observation, original_request: str,
         grounding: VisualGroundingRequest | None = None,
     ) -> VisualObservation:
+        directed = grounding is not None
+        requested_max = grounding.max_elements if grounding is not None else self.max_elements
+        prompt = (
+            directed_visual_prompt(
+                requested_max, grounding.objective,
+                verification_only=grounding.verification_only,
+            )
+            if grounding is not None else visual_prompt(requested_max, original_request)
+        )
         payload = {
             "model": self.model,
             "store": False,
             "reasoning": {"effort": "low"},
-            "max_output_tokens": 8000,
+            "max_output_tokens": OPENAI_DIRECTED_MAX_OUTPUT_TOKENS if directed else 8000,
             "input": [{
                 "role": "user", "content": [
-                    {"type": "input_text", "text": visual_prompt(self.max_elements, original_request)},
+                    {"type": "input_text", "text": prompt},
                     {"type": "input_image", "image_url": png_data_url(screenshot), "detail": "high"},
                 ],
             }],
             "text": {"format": {
                 "type": "json_schema", "name": "visible_ui_elements", "strict": True,
-                "schema": visual_schema(),
+                "schema": visual_schema(
+                    include_parent=not directed,
+                    include_activity=bool(grounding and grounding.verification_only),
+                ),
             }},
         }
         started = self._clock()
         try:
             response = self.transport.create(payload, self._api_key, self.timeout)
-        except VisualProviderFailure:
-            raise
+            latency_ms = max(0, round((self._clock() - started) * 1000))
+            parsed = strict_visual_json(_output_text(response))
+            candidates = tuple(
+                candidate_from_normalized(
+                    raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
+                    parent_required=not directed,
+                    verification_only=bool(grounding and grounding.verification_only),
+                )
+                for raw in parsed["elements"][:requested_max]
+            )
+        except VisualProviderFailure as exc:
+            raise exc.with_provider_context(self.name, self.model) from exc
         except (TimeoutError, socket.timeout) as exc:
-            raise VisualProviderFailure("timeout") from exc
+            raise VisualProviderFailure("timeout").with_provider_context(
+                self.name, self.model,
+            ) from exc
         except Exception as exc:
-            raise VisualProviderFailure("api_error") from exc
-        latency_ms = max(0, round((self._clock() - started) * 1000))
-        parsed = strict_visual_json(_output_text(response))
-        candidates = tuple(
-            candidate_from_normalized(raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height)
-            for raw in parsed["elements"][:self.max_elements]
-        )
+            raise VisualProviderFailure("unknown_api_error").with_provider_context(
+                self.name, self.model,
+            ) from exc
         return VisualObservation(
             candidates, self.name, self.model, latency_ms,
             token_usage(response, ("input_tokens", "output_tokens", "total_tokens")),
             False, self.pricing_class,
+            requested_max_elements=requested_max,
+            returned_visual_elements=len(candidates), directed_grounding=directed,
+            raw_element_count=len(parsed["elements"]),
+            parsed_element_count=len(candidates),
+        )
+
+
+class OpenAIVisualGrounder(OpenAIVisualObserver):
+    """Responses API grounder used as the one-shot Gemini provider fallback."""
+
+    def __init__(
+        self, api_key: str, *, model: str = OPENAI_VISUAL_MODEL, max_elements: int = 40,
+        timeout: float = 20, transport: JSONTransport | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        super().__init__(
+            api_key, model=model, max_elements=max_elements, timeout=timeout,
+            transport=transport, clock=clock,
         )

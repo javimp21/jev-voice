@@ -4,17 +4,24 @@ import argparse
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict
+import hashlib
+import inspect
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
+
+from dotenv import load_dotenv
 
 from agent.loop import Agent, AgentLimits, AgentResult
 from agent.hybrid_debug import (
     HybridClickDebugAgent, HybridDebugAgent, HybridResultDebugAgent, HybridTypeDebugAgent,
 )
-from agent.generic_task import GenericTaskBudgets, GenericTaskDebugAgent
+from agent.generic_task import (
+    GenericTaskBudgets, GenericTaskDebugAgent, GenericVisualDebugScreenshotDiagnostic,
+)
 from computer.actions import ClickAction, OpenAppAction, PressKeyAction, TypeAction
 from computer.applications import ApplicationCandidate
 from computer.windows_actions import LiteralInputFailure, WindowsComputer, debug_type_literal
@@ -41,6 +48,96 @@ from decision.models import DecisionResult
 from safety.policy import (
     AutonomousActionPolicy, CLICK_TYPES, GenericTargetActivationPolicy,
 )
+from voice.models import VoiceInputError
+from voice.service import voice_input_from_environment
+
+
+_VISUAL_PROVIDER_KEY_VARIABLES = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+_SAFE_VISUAL_PROVIDER_NAMES = frozenset(_VISUAL_PROVIDER_KEY_VARIABLES)
+
+
+def _accepts_keyword(method: object, parameter_name: str) -> bool:
+    if not callable(method):
+        return False
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    parameter = parameters.get(parameter_name)
+    return bool(
+        parameter is not None and parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+        or any(item.kind is inspect.Parameter.VAR_KEYWORD for item in parameters.values())
+    )
+
+
+def _generic_visual_configuration(
+    provider: object | None,
+    *,
+    configured_provider: str | None,
+    computer: object | None = None,
+    configuration_error: bool = False,
+    mode_enabled: bool = True,
+) -> dict[str, object]:
+    """Expose only bounded visual setup metadata; never serialize credentials."""
+    configured_name = (configured_provider or "").strip().casefold()
+    provider_name = (
+        configured_name if configured_name in _SAFE_VISUAL_PROVIDER_NAMES else None
+    )
+    if provider_name is None and provider is not None:
+        candidate_name = getattr(provider, "name", None)
+        if isinstance(candidate_name, str) and candidate_name.casefold() in _SAFE_VISUAL_PROVIDER_NAMES:
+            provider_name = candidate_name.casefold()
+    provider_configured = bool(configured_name or provider is not None)
+    key_variable = _VISUAL_PROVIDER_KEY_VARIABLES.get(provider_name or "")
+    api_key_present = bool(key_variable and os.environ.get(key_variable, ""))
+
+    capture_service = getattr(computer, "capture_service", None)
+    directed_observer = getattr(computer, "observe_directed", None)
+    visual_observer_present = capture_service is not None
+    provider_observe = getattr(provider, "observe", None)
+    directed_grounding_supported = bool(
+        visual_observer_present and callable(directed_observer)
+        and _accepts_keyword(provider_observe, "grounding")
+    )
+
+    reason: str | None = None
+    if not mode_enabled:
+        reason = "disabled_by_mode"
+    elif not provider_configured:
+        reason = "provider_missing"
+    elif provider_name is None:
+        reason = "configuration_error"
+    elif not api_key_present:
+        reason = "api_key_missing"
+    elif configuration_error:
+        reason = "configuration_error"
+    elif not visual_observer_present:
+        reason = "observer_missing"
+    elif not directed_grounding_supported:
+        reason = "directed_grounding_unsupported"
+
+    model_name: str | None = None
+    model = getattr(provider, "model", None) if provider is not None else None
+    if (provider_name is not None and isinstance(model, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/+-]{0,119}", model)):
+        model_name = model
+    return {
+        "visual_observer_present": visual_observer_present,
+        "directed_grounding_supported": directed_grounding_supported,
+        "provider_configured": provider_configured,
+        "provider_name": provider_name,
+        "model_name": model_name,
+        "api_key_present": api_key_present,
+        "visual_unavailable_reason": reason,
+    }
 
 
 def _candidate_json(candidate: ApplicationCandidate, score: int | None = None) -> dict[str, object]:
@@ -107,9 +204,66 @@ def _save_exact_result_capture(observation, capture, path: Path) -> dict[str, ob
     }
 
 
+def _save_exact_generic_capture(
+    observation, capture, path: Path, stage: str,
+) -> GenericVisualDebugScreenshotDiagnostic:
+    """Persist only an exact, fingerprint-bound PNG from generic directed grounding."""
+    fingerprint = observation.visual_request_fingerprint
+    if fingerprint is None or not fingerprint.directed:
+        return GenericVisualDebugScreenshotDiagnostic(
+            stage, False, error="directed_request_fingerprint_unavailable",
+        )
+    encoded = png_bytes(capture)
+    digest = hashlib.sha256(encoded).hexdigest()
+    if (len(encoded) != fingerprint.encoded_image_byte_length
+            or digest != fingerprint.screenshot_sha256):
+        return GenericVisualDebugScreenshotDiagnostic(
+            stage, False, error="capture_does_not_match_provider_input",
+        )
+    try:
+        save_debug_screenshot(capture, path)
+    except FileExistsError:
+        return GenericVisualDebugScreenshotDiagnostic(
+            stage, False, error="path_exists_or_parent_missing",
+        )
+    except ValueError:
+        return GenericVisualDebugScreenshotDiagnostic(stage, False, error="invalid_png_path")
+    except OSError:
+        return GenericVisualDebugScreenshotDiagnostic(stage, False, error="screenshot_save_failed")
+    saved = path.read_bytes()
+    saved_digest = hashlib.sha256(saved).hexdigest()
+    matches = (
+        saved == encoded
+        and len(saved) == fingerprint.encoded_image_byte_length
+        and saved_digest == fingerprint.screenshot_sha256
+    )
+    if not matches:
+        return GenericVisualDebugScreenshotDiagnostic(
+            stage, False, str(path), saved_digest, len(saved), False,
+            "saved_file_does_not_match_provider_input",
+        )
+    return GenericVisualDebugScreenshotDiagnostic(
+        stage, True, str(path), saved_digest, len(saved), True,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    # A project-local .env is convenient for development. Existing process
+    # variables remain authoritative, and python-dotenv does not print values.
+    load_dotenv(
+        dotenv_path=Path(__file__).resolve().parent / ".env",
+        override=False, verbose=False,
+    )
     parser = argparse.ArgumentParser(description="voice-jev: supervised Windows action debugging")
     commands = parser.add_subparsers(dest="command")
+    commands.add_parser(
+        "voice-transcribe",
+        help="Record and display one utterance; never executes computer actions",
+    )
+    commands.add_parser(
+        "run-agent-voice-debug",
+        help="Transcribe one utterance, display it, then use the confirmed generic debug path",
+    )
     commands.add_parser(
         "check-visual-provider",
         help="Check configured visual-provider metadata without uploading a screenshot",
@@ -157,6 +311,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     generic_agent.add_argument("--delay", type=float, default=0)
     generic_agent.add_argument("--max-controls", type=int, default=80)
     generic_agent.add_argument("--max-observed-text-length", type=int, default=500)
+    generic_agent.add_argument(
+        "--save-generic-visual-debug-screenshot", type=Path, default=None,
+        help=("Explicitly save exact masked PNGs sent for generic visual grounding; "
+              "additional stages receive deterministic filename suffixes"),
+    )
     hybrid_agent = commands.add_parser(
         "run-agent-hybrid-debug",
         help="Experimentally let Jev request directed vision; visual clicks always stop",
@@ -262,6 +421,37 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    voice_diagnostics: dict[str, object] | None = None
+    voice_ready_at: float | None = None
+    if args.command in {"voice-transcribe", "run-agent-voice-debug"}:
+        try:
+            voice_result = voice_input_from_environment().capture_and_transcribe()
+        except KeyboardInterrupt:
+            return 130
+        except VoiceInputError as exc:
+            error_payload: dict[str, object] = {
+                "success": False,
+                "error": exc.category,
+                "message": exc.safe_message,
+            }
+            if exc.provider_diagnostics is not None:
+                error_payload.update(exc.provider_diagnostics.as_dict())
+            print(json.dumps(error_payload, indent=2, ensure_ascii=True), file=sys.stderr)
+            return 1
+        voice_diagnostics = voice_result.diagnostics()
+        print(f"Transcript: {voice_result.transcript.text}", flush=True)
+        if args.command == "voice-transcribe":
+            print(json.dumps({"voice_input": voice_diagnostics}, indent=2, ensure_ascii=True))
+            return 0
+        # Feed only the minimally normalized transcript to the existing generic
+        # debug command. Its confirmation and safety path remain authoritative.
+        voice_ready_at = time.perf_counter()
+        args.command = "run-agent-generic-debug"
+        args.request = voice_result.transcript.text
+        args.delay = 0
+        args.max_controls = 80
+        args.max_observed_text_length = 500
+        args.save_generic_visual_debug_screenshot = None
     try:
         options = ObservationOptions(
             max_depth=getattr(args, "max_depth", 6), max_controls=getattr(args, "max_controls", 100),
@@ -278,6 +468,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     or not result_path.parent.is_dir()):
                 raise ValueError(
                     "result debug screenshot must be a new .png in an existing directory",
+                )
+        generic_screenshot = getattr(args, "save_generic_visual_debug_screenshot", None)
+        if generic_screenshot is not None:
+            generic_path = generic_screenshot.resolve()
+            if (generic_path.suffix.casefold() != ".png" or generic_path.exists()
+                    or not generic_path.parent.is_dir()):
+                raise ValueError(
+                    "generic visual debug screenshot must be a new .png in an existing directory",
                 )
         if args.command in {
             "run-agent", "run-agent-hybrid-debug", "run-agent-hybrid-click-debug",
@@ -365,6 +563,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             visual_provider = visual_provider_from_environment()
         except VisualProviderConfigurationError as exc:
+            if args.command == "run-agent-generic-debug":
+                visual_configuration = _generic_visual_configuration(
+                    None,
+                    configured_provider=os.environ.get("VISUAL_PROVIDER"),
+                    computer=WindowsComputer,
+                    configuration_error=True,
+                )
+                print(json.dumps({
+                    "success": False,
+                    "stop_reason": "visual_configuration_error",
+                    "message": "Visual provider configuration is unavailable.",
+                    "visual_configuration": visual_configuration,
+                }, indent=2, ensure_ascii=True), file=sys.stderr)
+                return 1
             print(json.dumps({"success": False, "error": str(exc)}, indent=2), file=sys.stderr)
             return 1
     if args.command == "list-apps":
@@ -591,7 +803,58 @@ def main(argv: Sequence[str] | None = None) -> int:
             options, app_catalog=catalog,
             capture_service=WindowsWindowCapture() if visual_provider is not None else None,
             visual_provider=visual_provider,
+            retain_debug_capture=(args.save_generic_visual_debug_screenshot is not None),
         )
+        visual_configuration = _generic_visual_configuration(
+            visual_provider,
+            configured_provider=os.environ.get("VISUAL_PROVIDER"),
+            computer=computer,
+        )
+        print(json.dumps({
+            "visual_configuration": visual_configuration,
+        }, indent=2, ensure_ascii=True), file=sys.stderr)
+        capture_callback = None
+        if args.save_generic_visual_debug_screenshot is not None:
+            print(
+                "WARNING: saved masked screenshots may contain sensitive UI contents; "
+                "additional grounding stages use suffixed filenames.",
+                file=sys.stderr,
+            )
+            output_base = args.save_generic_visual_debug_screenshot.resolve()
+            stage_counts: Counter[str] = Counter()
+            capture_call_count = 0
+
+            def save_generic_capture(stage: str, observation):
+                nonlocal capture_call_count
+                capture = computer.take_debug_capture()
+                if capture is None:
+                    return GenericVisualDebugScreenshotDiagnostic(
+                        stage, False, error="debug_capture_unavailable",
+                    )
+                try:
+                    capture_call_count += 1
+                    stage_name = {
+                        "target-resolution": "target-resolution",
+                        "target-resolution-after-type": "target-resolution-after-type",
+                        "target-resolution-after-submit": "target-resolution-after-submit",
+                        "query-field": "query-field",
+                    }.get(stage, "visual-grounding")
+                    stage_counts[stage_name] += 1
+                    if capture_call_count == 1:
+                        path = output_base
+                    else:
+                        occurrence = stage_counts[stage_name]
+                        suffix = stage_name if occurrence == 1 else f"{stage_name}-{occurrence}"
+                        path = output_base.with_name(
+                            f"{output_base.stem}-{suffix}{output_base.suffix}",
+                        )
+                    report = _save_exact_generic_capture(
+                        observation, capture, path, stage_name,
+                    )
+                    return report
+                finally:
+                    capture.discard()
+
         print(
             "WARNING: one trusted app launch, one query-field activation, one literal query, one query submit, "
             "and one final target activation may occur. "
@@ -611,12 +874,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             budgets=GenericTaskBudgets(
                 app_activation_timeout_seconds=open_app_activation_timeout,
             ),
+            visual_debug_capture_callback=save_generic_capture if (
+                args.save_generic_visual_debug_screenshot is not None
+            ) else None,
         )
         try:
+            handoff_to_agent_ms = (
+                round((time.perf_counter() - voice_ready_at) * 1000)
+                if voice_ready_at is not None else None
+            )
             result = agent.run(args.request)
         except KeyboardInterrupt:
             return 130
-        print(json.dumps(asdict(result), indent=2, ensure_ascii=True))
+        result_json = asdict(result)
+        result_json["visual_configuration"] = visual_configuration
+        if voice_diagnostics is not None:
+            voice_diagnostics["handoff_to_agent_ms"] = handoff_to_agent_ms
+            result_json["voice_input"] = voice_diagnostics
+        print(json.dumps(result_json, indent=2, ensure_ascii=True))
         return 0 if result.success else 1
     if args.command == "run-agent":
         try:
@@ -817,6 +1092,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             "provider_latency_ms": observation.visual_latency_ms,
             "visual_provider_call_count": observation.visual_provider_call_count,
+            "visual_provider_attempts": [
+                asdict(item) for item in observation.visual_provider_attempts
+            ],
+            "selected_visual_provider": observation.selected_visual_provider,
+            "provider_failover_used": observation.provider_failover_used,
+            "provider_failover_reason": observation.provider_failover_reason,
             "timing": {
                 "screenshot_capture_ms": observation.screenshot_capture_ms,
                 "request_build_ms": observation.visual_request_build_ms,

@@ -394,6 +394,10 @@ def test_connectivity_check_preserves_safe_http_failure() -> None:
         "category": "authentication_error", "http_status": 401,
         "provider_code": "invalid_key",
         "message": "The visual provider rejected the API credentials.",
+        "provider_name": None, "provider_model": None,
+        "provider_error_type": None, "provider_request_id": None,
+        "provider_error_category": "authentication",
+        "provider_status_code": 401, "provider_error_code": "invalid_key",
     }
 
 

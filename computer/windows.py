@@ -15,6 +15,7 @@ from uuid import uuid4
 from computer.applications import ApplicationCatalog
 from computer.models import (
     Observation, Rect, ResultReadinessResult, UIElement, VisualCandidateProviderDiagnostic,
+    VisualProviderAttempt,
     VisualGroundingStatus, VisualPipelineDiagnostic,
     VisualReadinessReason, VisualReadinessResult,
 )
@@ -326,6 +327,7 @@ class WindowsObserver:
                 if name or automation_id or kind in _USEFUL_UNNAMED:
                     is_password = read(lambda: _uia_flag(node, "CurrentIsPassword"), None)
                     focused = read(lambda: _uia_flag(node, "CurrentHasKeyboardFocus"), None)
+                    selected = read(lambda: _uia_flag(node, "CurrentIsSelected"), None)
                     observed_text, observed_text_truncated = (
                         _editable_text(node, options.max_observed_text_length)
                         if (kind in {"Edit", "Document"} and is_password is False
@@ -342,6 +344,7 @@ class WindowsObserver:
                         is_password=is_password, observed_text=observed_text,
                         observed_text_truncated=observed_text_truncated,
                         parent_name=parent_name, parent_control_type=parent_type,
+                        selected=selected,
                     ))
                     self._nodes[controls[-1].id] = node
             if depth < options.max_depth:
@@ -675,6 +678,10 @@ class WindowsObserver:
         provider_model = str(getattr(self.visual_provider, "model", ""))[:100] or None
         provider_latency = None
         provider_usage: tuple[tuple[str, int], ...] = ()
+        provider_attempts: tuple[VisualProviderAttempt, ...] = ()
+        selected_visual_provider: str | None = None
+        provider_failover_used = False
+        provider_failover_reason: str | None = None
         provider_pricing = str(getattr(self.visual_provider, "pricing_class", ""))[:40] or None
         execution_authorized = False
         request_build_ms = None
@@ -714,6 +721,17 @@ class WindowsObserver:
                 provider_name = provider_result.provider[:80]
                 provider_model = provider_result.model[:100] or None
                 provider_latency = provider_result.latency_ms
+                provider_attempts = provider_result.provider_attempts or (
+                    VisualProviderAttempt(
+                        provider_name, provider_model or "",
+                        max(0, provider_latency or 0),
+                        "success_with_candidates" if provider_result.candidates else "success_empty",
+                    ),
+                )
+                selected_visual_provider = provider_result.provider[:80]
+                provider_failover_used = provider_result.provider_failover_used
+                provider_failover_reason = provider_result.provider_failover_reason
+                provider_call_count = max(1, len(provider_attempts))
                 provider_usage = provider_result.usage
                 provider_pricing = provider_result.pricing_class[:40]
                 execution_authorized = provider_result.execution_authorized
@@ -830,6 +848,10 @@ class WindowsObserver:
                 visual_usage=provider_usage,
                 visual_pricing_class=provider_pricing,
                 visual_execution_authorized=execution_authorized,
+                visual_provider_attempts=provider_attempts,
+                selected_visual_provider=selected_visual_provider,
+                provider_failover_used=provider_failover_used,
+                provider_failover_reason=provider_failover_reason,
                 screenshot_capture_ms=screenshot_capture_ms,
                 visual_request_build_ms=request_build_ms,
                 visual_response_parse_ms=response_parse_ms,
@@ -859,6 +881,10 @@ class WindowsObserver:
                 visual_model=provider_model, visual_pricing_class=provider_pricing,
                 visual_latency_ms=failure_latency,
                 visual_provider_error=exc.diagnostic,
+                visual_provider_attempts=exc.provider_attempts,
+                selected_visual_provider=exc.selected_visual_provider,
+                provider_failover_used=exc.provider_failover_used,
+                provider_failover_reason=exc.provider_failover_reason,
                 screenshot_capture_ms=screenshot_capture_ms,
                 visual_total_observation_ms=max(
                     0, round((time.monotonic() - visual_started) * 1000),
@@ -879,14 +905,19 @@ class WindowsObserver:
                 capture_diagnostics=capture.diagnostics,
                 visual_readiness=readiness,
                 result_readiness=result_readiness,
-                visual_provider_call_count=provider_call_count,
+                visual_provider_call_count=max(1, len(exc.provider_attempts)),
                 visual_provider_candidates=provider_candidate_diagnostics,
             )
         except Exception:
+            failure = VisualProviderFailure("unknown_api_error").with_provider_context(
+                provider_name or "unknown", provider_model or "",
+                provider_attempts=(), selected_visual_provider=None,
+            )
             return replace(
                 observation, screenshot=capture.metadata, visual_provider=provider_name,
                 visual_model=provider_model, visual_pricing_class=provider_pricing,
-                visual_provider_error=VisualProviderFailure("unknown_api_error").diagnostic,
+                visual_provider_error=failure.diagnostic,
+                selected_visual_provider=None,
                 screenshot_capture_ms=screenshot_capture_ms,
                 visual_total_observation_ms=max(
                     0, round((time.monotonic() - visual_started) * 1000),
@@ -908,4 +939,11 @@ class WindowsObserver:
             )
         finally:
             if capture is not None:
-                capture.discard()
+                if self.retain_debug_capture:
+                    # Keep the exact masked provider input available to an
+                    # explicitly opted-in debug callback, including when the
+                    # provider returns a typed error. The caller consumes it
+                    # once via take_debug_capture(); normal runs still discard.
+                    self._debug_capture = capture
+                else:
+                    capture.discard()

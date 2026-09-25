@@ -10,7 +10,7 @@ from PIL import Image
 import pytest
 
 from computer.models import Observation, Rect, ScreenshotMetadata
-from computer.visual import ScreenshotCapture, VisualProviderFailure
+from computer.visual import ScreenshotCapture, VisualGroundingRequest, VisualProviderFailure
 from computer.visual import bounded_grounding_request
 from computer.visual_providers import (
     VisualProviderConfigurationError, check_visual_provider_from_environment,
@@ -87,7 +87,7 @@ def test_gemini_valid_structured_observation_is_provider_neutral() -> None:
     }
     assert "gemini-secret" not in json.dumps(safe_request_shape(payload))
     assert parts[1]["inlineData"]["data"] not in json.dumps(safe_request_shape(payload))
-    assert key == "gemini-secret" and timeout == 20
+    assert key == "gemini-secret" and timeout == 6
     assert result.candidates[0].rectangle == Rect(100, 50, 300, 150)
     assert result.candidates[0].confidence is None
     assert result.execution_authorized is False
@@ -128,6 +128,31 @@ def test_gemini_directed_grounding_is_compact_bounded_and_observation_only() -> 
     assert result.candidates[0].parent == ""
     assert result.candidates[0].confidence is None
     assert result.execution_authorized is False
+    shot.discard()
+
+
+def test_gemini_activation_verification_uses_structured_activity_evidence() -> None:
+    raw = directed_element()
+    raw["activity"] = "active"
+    provider, transport = provider_with(response([raw]))
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        'Verify whether "Iago" is currently the active conversation.', 5,
+        verification_only=True,
+    )
+
+    result = provider.observe(shot, Observation("app", "Window"), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["contents"][0]["parts"][0]["text"]
+    schema = payload["generationConfig"]["responseJsonSchema"]["properties"]["elements"]["items"]
+    assert "name being visible alone is never active evidence" in prompt
+    assert schema["properties"]["activity"]["enum"] == ["active", "not_active", "unknown"]
+    assert "activity" in schema["required"]
+    assert result.candidates[0].activity == "active"
+    assert result.execution_authorized is False
+    fingerprint = provider.request_fingerprint(shot, grounding)
+    assert fingerprint is not None and fingerprint.schema_version == "2"
     shot.discard()
 
 
@@ -270,17 +295,23 @@ def test_gemini_environment_selection_missing_key_and_disabled_actions(
 ) -> None:
     monkeypatch.setenv("VISUAL_PROVIDER", "gemini")
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with pytest.raises(VisualProviderConfigurationError, match="GEMINI_API_KEY"):
         visual_provider_from_environment()
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     provider = visual_provider_from_environment()
     assert isinstance(provider, GeminiVisualObserver)
     assert provider.model == GEMINI_VISUAL_MODEL
-    assert provider.timeout == 20
+    assert provider.timeout == 6
+    assert provider.openai_fallback is None
     assert provider.directed_max_output_tokens == 800
     assert isinstance(provider.transport, HTTPSJSONTransport)
     monkeypatch.setenv("GEMINI_VISUAL_MODEL", "gemini-custom-flash")
     assert visual_provider_from_environment().model == "gemini-custom-flash"
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    monkeypatch.setenv("OPENAI_VISUAL_MODEL", "gpt-5.6-luna")
+    configured = visual_provider_from_environment()
+    assert configured.openai_fallback.model == "gpt-5.6-luna"
     monkeypatch.setenv("VISUAL_ACTIONS_ENABLED", "true")
     with pytest.raises(VisualProviderConfigurationError, match="cannot be enabled"):
         visual_provider_from_environment()

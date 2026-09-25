@@ -143,3 +143,11 @@ class TargetChoiceResult:
     confidence: float | None
     message: str
     error: str | None = None
+    diagnostic_reason: Literal[
+        "resolution_ineligible", "candidate_limit", "candidate_invalid",
+        "evidence_indistinguishable", "model_stop",
+        "model_confidence_below_threshold", "candidate_selected",
+        "provider_error", "invalid_response", "internal_error",
+    ] | None = None
+    provider_called: bool | None = None
+    proposed_candidate_id: str | None = None

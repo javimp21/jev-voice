@@ -7,7 +7,8 @@ with a new Windows architecture; no macOS source is ported.
 **Generic installed-application discovery, UI observation, supervised typed
 execution, hybrid UIA/window-capture observation, Jev decisions, and a bounded
 request loop and observation-only OpenRouter, Gemini, DeepSeek, and OpenAI visual adapters are implemented.**
-No global shortcut, microphone capture, speech recognition, OCR pipeline, real
+One-shot CLI push-to-talk capture and speech transcription are also available.
+No global shortcut, wake word, continuous listening, TTS, OCR pipeline, real
 visual coordinate execution, or unbounded autonomy is included.
 Automated tests mock Windows and never control the desktop.
 
@@ -21,6 +22,12 @@ py -3.13 -m venv .venv
 .\.venv\Scripts\python.exe -m pytest
 .\.venv\Scripts\python.exe main.py observe
 ```
+
+The CLI automatically loads `.env` from the project directory. Copy
+`.env.example` to `.env` and add local credentials there, or set them in the
+PowerShell session. Existing process environment variables take precedence over
+`.env`; the CLI does not print API keys or `.env` contents. `.env` is ignored by
+Git.
 
 No virtual environment activation is required. `decide` and `run-agent` require
 an API key; observation, manual actions, and tests do not. pywinauto is a
@@ -357,7 +364,17 @@ $env:GEMINI_VISUAL_MODEL = 'gemini-3.5-flash-lite'
 $env:VISUAL_MAX_ELEMENTS = '40'
 $env:VISUAL_TIMEOUT_SECONDS = '20'
 $env:VISUAL_ACTIONS_ENABLED = 'false'
+# Optional one-shot fallback after a retryable Gemini provider failure.
+$env:OPENAI_VISUAL_MODEL = 'gpt-5.6-luna'
 ```
+
+When `VISUAL_PROVIDER=gemini` and `OPENAI_API_KEY` is present, directed visual
+grounding tries Gemini once with a six-second maximum deadline. A timeout,
+connection/rate-limit/server failure, or invalid structured response can trigger
+one OpenAI Responses request using the same masked screenshot and grounding
+objective. A valid empty Gemini result is accepted without fallback. The
+fallback can incur OpenAI API charges; omit `OPENAI_API_KEY` to disable it.
+Neither provider is allowed to click, type, or select an action.
 
 Then run the diagnostic and manually switch to the target application:
 
@@ -502,8 +519,20 @@ coordinates, window handles, or screenshot data.
 
 Trusted app activation uses the same `OPEN_APP_ACTIVATION_TIMEOUT_SECONDS`
 setting and polling interval as the hybrid debug mode (3 seconds by default,
-200 ms polls). A timeout includes bounded foreground identity and transition
-diagnostics; it omits window titles, package internals, paths, and command lines.
+200 ms polls). This generic debug mode first observes passively; after two
+consecutive probes find the same unique, visible, catalog-matched window, it
+makes at most one `SetForegroundWindow` call. A visible minimized target is
+restored with `ShowWindowAsync(SW_RESTORE)` before that call. It then requires a fresh
+foreground observation to succeed. Windows can reject foreground changes while
+the user is working in another window, so this remains best effort and does not
+simulate keyboard or mouse input. The ordinary `run-agent` and hybrid modes
+remain unchanged. Diagnostics omit HWNDs, PIDs, window titles, package internals,
+paths, and command lines.
+
+See Microsoft's [`SetForegroundWindow`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow),
+[`ShowWindowAsync`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-showwindowasync),
+and [`IsWindow`](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-iswindow)
+documentation for the API behavior and foreground restrictions.
 
 The local result readiness wait defaults to seven seconds with 200 ms polling
 and requires 1200 ms of quiet after the latest meaningful visual transition.
@@ -699,8 +728,9 @@ The command prints `EXPERIMENTAL HYBRID DEBUG` and `VISUAL EXECUTION: DISABLED`
 before asking whether safe local/UIA actions may run. A stop at a semantic visual
 target is the expected outcome in this phase. Directed grounding measured about
 2–3 seconds for the tested Spotify search-field and result cases; that local
-measurement is not a universal latency claim. Voice, STT, TTS, speculative
-execution, and autonomous visual clicking are not part of this path.
+measurement is not a universal latency claim. The separate one-shot voice CLI
+does not add voice logic to this hybrid path. TTS, speculative execution, and
+autonomous visual clicking are not part of it.
 
 To inspect directed boxes explicitly (the file can contain private visible
 content and is never saved by default):
@@ -757,8 +787,10 @@ Provider response bodies and provider-supplied free-form messages are never prin
 Remote visual HTTP operations have a 20-second hard wall-clock deadline by
 default. The deadline covers connection setup, TLS, request transmission,
 response headers, and the complete bounded response body, including chunked
-responses. `VISUAL_TIMEOUT_SECONDS` accepts values from 1 through 120. A timeout
-preserves the UIA observation and appears as a structured `timeout` provider error.
+responses. `VISUAL_TIMEOUT_SECONDS` accepts values from 1 through 120. Gemini's
+interactive request is capped at six seconds (or the shorter configured shared
+timeout), and this adapter uses one HTTP attempt with no SDK retry/backoff. A
+timeout preserves the UIA observation and appears as a structured provider error.
 
 Remote screenshots can contain private visible content. OpenRouter is an
 intermediary and sends image input to an underlying model provider; retention
@@ -826,8 +858,8 @@ is produced. Delay prompts also use stderr, so redirected diagnostics are a log,
 not necessarily one JSON document. Debug output contains ordinary window labels
 and your request: credential filtering does not make it safe to publish blindly.
 
-The environment template lists the supported variables; `.env` files are not
-automatically loaded. A missing key fails before desktop inspection or networking.
+The environment template lists the supported variables. A missing key fails
+before desktop inspection or networking.
 Use `--max-controls 40` if a large UI exceeds the decision payload budget.
 
 ### Verified TypeSafe integration
@@ -1075,7 +1107,11 @@ No application was launched or manipulated for this test.
 
 | Module | Responsibility |
 | --- | --- |
-| `voice/interfaces.py` | Separate recording and speech-to-text protocols |
+| `voice/models.py` | In-memory audio, transcript, and safe voice diagnostic models |
+| `voice/interfaces.py` | Provider-independent microphone and speech-to-text contracts |
+| `voice/audio.py` | Bounded Windows Enter/Enter push-to-talk WAV capture |
+| `voice/openai_stt.py` | OpenAI `gpt-transcribe` adapter with bounded retry and sanitized errors |
+| `voice/service.py` | One-shot orchestration and whitespace-only transcript normalization |
 | `computer/actions.py` | Frozen typed action requests and `Action` union |
 | `computer/applications.py` | Platform-neutral catalog, candidate, matching, and test catalog contracts |
 | `computer/models.py` | Platform-neutral UI elements and observations |
@@ -1105,7 +1141,7 @@ No application was launched or manipulated for this test.
 Planned flow:
 
 ```text
-global shortcut -> recording -> transcription -> request
+CLI Enter-to-start/Enter-to-stop -> recording -> transcription -> visible transcript
   -> application discovery -> foreground window
   -> UIA + conditional capture/visual provider -> unified observation
   -> decide -> validate / confirm -> act -> fresh observation -> ...
@@ -1129,8 +1165,28 @@ control labels, observed values, response bodies, or typed literals are included
 
 The agent accepts a text request so voice capture remains independent of the
 computer loop. Contracts are synchronous for now. The coordinator handles
-cancellation, errors, denied actions, and a bounded step count; microphone and
-global-shortcut integration remain separate future work.
+cancellation, errors, denied actions, and a bounded step count. The first voice
+adapter is available as a CLI input path; global-shortcut integration remains
+future work.
+
+## One-shot voice input
+
+Install the normal project dependencies, set `OPENAI_API_KEY` in `.env`, then
+run `python main.py voice-transcribe` for one push-to-talk recording. Press
+Enter to start recording and Enter again to stop it (maximum 15 seconds by
+default). The command displays the transcript and diagnostics, and never
+creates a computer or executes an action. `python main.py run-agent-voice-debug`
+shows the transcript and then uses the same explicit confirmation and safety
+boundary as `run-agent-generic-debug`. The normalized transcript is passed
+directly to that existing agent; voice does not rewrite or translate it.
+
+The microphone adapter uses `sounddevice` for mono 16 kHz PCM capture and keeps
+the WAV in memory only. OpenAI's recommended `gpt-transcribe` transcription
+adapter uses the existing `OPENAI_API_KEY`; the audio is sent to OpenAI for transcription.
+`VOICE_STT_TIMEOUT_SECONDS` defaults to 20 seconds and the SDK is configured for
+at most one retry. Transcripts are trimmed and repeated whitespace is collapsed;
+no language is forced. Raw audio is not written to disk or included in
+diagnostics, and is released after transcription on success or failure.
 
 Actions use fixed `kind` discriminators. Click targets are opaque IDs from the
 latest observation, not coordinates or native Windows handles. Text entry is
@@ -1148,17 +1204,18 @@ foundation rather than a general-purpose autonomous computer agent.
 
 ## Secrets and privacy
 
-`.env.example` contains an empty key placeholder and non-secret defaults. The app
-does not load environment files. Keep credentials in local environment
-variables or an ignored `.env`; never put actual API keys in code, tests, logs,
-or commits. `.gitignore` excludes environment files, key files, recordings,
-observations, and logs. Review staged changes before committing; ignore rules
-do not protect secrets pasted into tracked files.
+`.env.example` contains blank key placeholders and non-secret defaults. The CLI
+loads the project-local `.env` without overriding existing process environment
+variables. Keep credentials in local environment variables or an ignored `.env`;
+the CLI does not log keys or file contents. Never put actual API keys in code,
+tests, logs, or commits. `.gitignore` excludes environment files, key files,
+recordings, observations, and logs. Review staged changes before committing;
+ignore rules do not protect secrets pasted into tracked files.
 
 ## Scope and licensing
 
 The Jev integration follows the official HTTP API and TYPESAFE_API_KEY convention.
-No audio library, shortcut library, TTS, OCR pipeline, real visual coordinate
-execution, or free-form text generator is included. Real desktop coverage
+No global shortcut library, TTS, OCR pipeline, real visual coordinate execution,
+or free-form text generator is included. Real desktop coverage
 depends on the target application and Windows session permissions.
 An open-source license must be chosen before publishing; none is assumed here.

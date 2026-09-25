@@ -276,7 +276,7 @@ def _canonical_generic_role(value: str | None) -> str | None:
 
 
 def generic_uia_semantic_role(control) -> str | None:
-    """Infer only explicit generic semantic roles from bounded UIA labels."""
+    """Infer domain meaning from UIA context, never from the target's own UI role."""
     parent_words = set(_normalized_words(control.parent_name).split())
     if parent_words & {"conversation", "conversations", "chat", "chats"}:
         return "conversation"
@@ -289,10 +289,8 @@ def generic_uia_semantic_role(control) -> str | None:
     if parent_words & {"navigation", "menu", "tabs"}:
         return "navigation_destination"
     parent_role = _canonical_generic_role(control.parent_control_type)
-    if parent_role in {"conversation", "contact", "file", "container", "navigation_destination"}:
+    if parent_role in {"conversation", "contact", "file", "container"}:
         return parent_role
-    if control.control_type in {"TabItem", "MenuItem"}:
-        return "navigation_destination"
     return None
 
 

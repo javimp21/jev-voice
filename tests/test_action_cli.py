@@ -2,6 +2,8 @@
 
 from unittest.mock import Mock
 import json
+import os
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
@@ -330,6 +332,7 @@ def test_hybrid_debug_cli_announces_disabled_visual_execution(
     assert "EXPERIMENTAL HYBRID DEBUG" in captured.err
     assert "VISUAL EXECUTION: DISABLED" in captured.err
     assert json.loads(captured.out)["stop_reason"] == "visual_action_blocked_for_debug"
+    assert "visual_configuration" not in json.loads(captured.out)
     hybrid_agent.run.assert_called_once_with("Open Spotify and play Californication")
     assert cli.WindowsComputer.call_args.kwargs["retain_debug_capture"] is False
     assert cli.HybridDebugAgent.call_args.kwargs["directed_capture_callback"] is None
@@ -581,6 +584,7 @@ def test_run_agent_dry_run_never_prompts_or_executes(
     captured = capsys.readouterr()
     result = json.loads(captured.out)
     assert result["stop_reason"] == "needs_human"
+    assert "visual_configuration" not in result
     assert secret not in captured.out + captured.err
     computer.execute.assert_not_called()
 
@@ -623,3 +627,358 @@ def test_generic_debug_cli_is_separate_and_requires_confirmation(
     assert json.loads(captured.out)["stop_reason"] == "target_activated"
     agent.run.assert_called_once_with(request)
     assert agent_factory.call_args.kwargs["budgets"].app_activation_timeout_seconds == 4.5
+    assert cli.WindowsComputer.call_args.kwargs["retain_debug_capture"] is False
+    assert agent_factory.call_args.kwargs["visual_debug_capture_callback"] is None
+
+
+def test_generic_debug_cli_saves_only_exact_opt_in_provider_pngs_with_stage_names(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    from computer.visual_providers.common import png_fingerprint, png_bytes
+
+    image = Image.new("RGB", (20, 10), "darkgreen")
+    metadata = ScreenshotMetadata(
+        "target-resolution", 77, Rect(0, 0, 20, 10), Rect(0, 0, 20, 10),
+        20, 10, 96, 96, 1, 1, masked_regions=1,
+    )
+    captures = [
+        ScreenshotCapture(metadata, image.copy()),
+        ScreenshotCapture(metadata, image.copy()),
+    ]
+    byte_length, digest = png_fingerprint(captures[0])
+    provider_png = png_bytes(captures[0])
+    observations = [
+        Observation(
+            "app.exe", "Window", observation_id=stage,
+            screenshot=ScreenshotMetadata(
+                stage, 77, Rect(0, 0, 20, 10), Rect(0, 0, 20, 10),
+                20, 10, 96, 96, 1, 1, masked_regions=1,
+            ),
+            visual_request_fingerprint=VisualRequestFingerprint(
+                "gemini", "gemini-3.5-flash-lite", True, 5, 800,
+                "application/json", "visual_elements", "1", (20, 10),
+                byte_length, digest, 40,
+            ),
+        )
+        for stage in ("target-resolution", "query-field")
+    ]
+    catalog = MemoryApplicationCatalog(())
+    decision = Mock(min_confidence=.8)
+    computer = Mock(take_debug_capture=Mock(side_effect=captures))
+
+    class FakeGenericAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            self.callback = kwargs["visual_debug_capture_callback"]
+
+        def run(self, _request: str) -> GenericTaskDebugResult:
+            reports = tuple(
+                self.callback(stage, observation)
+                for stage, observation in zip(
+                    ("target-resolution", "query-field"), observations,
+                )
+            )
+            return GenericTaskDebugResult(
+                False, "query_field_not_verified", "stopped", 4,
+                visual_debug_screenshots=reports,
+            )
+
+    monkeypatch.setattr(cli, "visual_provider_from_environment", Mock(return_value=None))
+    monkeypatch.setattr(cli, "WindowsApplicationCatalog", Mock(return_value=catalog))
+    computer_type = Mock(return_value=computer)
+    monkeypatch.setattr(cli, "WindowsComputer", computer_type)
+    monkeypatch.setattr(cli.JevDecisionMaker, "from_environment", Mock(return_value=decision))
+    monkeypatch.setattr(cli, "GenericTaskDebugAgent", FakeGenericAgent)
+    monkeypatch.setattr("builtins.input", lambda: "yes")
+    base_path = tmp_path / "generic.png"
+
+    assert cli.main([
+        "run-agent-generic-debug", "request", "--delay", "0",
+        "--save-generic-visual-debug-screenshot", str(base_path),
+    ]) == 1
+
+    suffix_path = tmp_path / "generic-query-field.png"
+    assert base_path.read_bytes() == provider_png
+    assert suffix_path.read_bytes() == provider_png
+    assert computer_type.call_args.kwargs["retain_debug_capture"] is True
+    assert computer.take_debug_capture.call_count == 2
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert [item["stage"] for item in output["visual_debug_screenshots"]] == [
+        "target-resolution", "query-field",
+    ]
+    assert [item["path"] for item in output["visual_debug_screenshots"]] == [
+        str(base_path.resolve()), str(suffix_path.resolve()),
+    ]
+    assert all(item["saved"] and item["matches_request_fingerprint"] for item in
+               output["visual_debug_screenshots"])
+    assert all(item["sha256"] == digest and item["byte_length"] == byte_length
+               for item in output["visual_debug_screenshots"])
+    assert "may contain sensitive UI contents" in captured.err
+    image.close()
+
+
+def test_generic_debug_capture_refuses_to_overwrite_existing_file(tmp_path) -> None:
+    from computer.visual_providers.common import png_fingerprint
+
+    metadata = ScreenshotMetadata(
+        "target-resolution", 77, Rect(0, 0, 20, 10), Rect(0, 0, 20, 10),
+        20, 10, 96, 96, 1, 1,
+    )
+    capture = ScreenshotCapture(metadata, Image.new("RGB", (20, 10), "purple"))
+    length, digest = png_fingerprint(capture)
+    observation = Observation(
+        "app.exe", "Window", observation_id="target-resolution", screenshot=metadata,
+        visual_request_fingerprint=VisualRequestFingerprint(
+            "gemini", "gemini-3.5-flash-lite", True, 5, 800,
+            "application/json", "visual_elements", "1", (20, 10),
+            length, digest, 40,
+        ),
+    )
+    path = tmp_path / "already-exists.png"
+    path.write_bytes(b"preserve-existing-content")
+
+    report = cli._save_exact_generic_capture(observation, capture, path, "target-resolution")
+
+    assert not report.saved
+    assert report.error == "path_exists_or_parent_missing"
+    assert path.read_bytes() == b"preserve-existing-content"
+    capture.discard()
+
+
+def test_generic_debug_cli_rejects_existing_capture_path_before_setup(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    existing = tmp_path / "existing.png"
+    existing.write_bytes(b"keep")
+    computer_type = Mock(side_effect=AssertionError("must reject before desktop setup"))
+    monkeypatch.setattr(cli, "WindowsComputer", computer_type)
+
+    with pytest.raises(SystemExit) as caught:
+        cli.main([
+            "run-agent-generic-debug", "request",
+            "--save-generic-visual-debug-screenshot", str(existing),
+        ])
+
+    assert caught.value.code == 2
+    assert "must be a new .png" in capsys.readouterr().err
+    computer_type.assert_not_called()
+    assert existing.read_bytes() == b"keep"
+
+
+def test_cli_loads_local_env_and_preserves_process_environment_precedence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "TYPESAFE_API_KEY=dotenv-test-secret\n"
+        "JEV_MODEL=jev-1.13.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "main.py"))
+    monkeypatch.setenv("TYPESAFE_API_KEY", "process-test-secret")
+    monkeypatch.delenv("JEV_MODEL", raising=False)
+    observed: dict[str, str | None] = {}
+
+    def safe_provider_check() -> dict[str, object]:
+        observed["api_key"] = os.environ.get("TYPESAFE_API_KEY")
+        observed["model"] = os.environ.get("JEV_MODEL")
+        return {"connectivity": True, "model_available": True, "api_key_present": True}
+
+    monkeypatch.setattr(cli, "check_visual_provider_from_environment", safe_provider_check)
+
+    assert cli.main(["check-visual-provider"]) == 0
+
+    output = capsys.readouterr().out
+    assert observed == {"api_key": "process-test-secret", "model": "jev-1.13.0"}
+    assert "process-test-secret" not in output
+    assert "dotenv-test-secret" not in output
+    assert "jev-1.13.0" not in output
+
+
+def test_cli_reports_missing_configuration_without_constructing_computer(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "main.py"))
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setenv("VISUAL_PROVIDER", "")
+    monkeypatch.setattr(
+        cli, "WindowsApplicationCatalog",
+        Mock(return_value=MemoryApplicationCatalog(())),
+    )
+    computer_type = Mock(side_effect=AssertionError("missing config must fail first"))
+    monkeypatch.setattr(cli, "WindowsComputer", computer_type)
+
+    assert cli.main(["run-agent", "request", "--dry-run"]) == 1
+
+    captured = capsys.readouterr()
+    assert "TYPESAFE_API_KEY" in captured.out
+    assert "api key" not in captured.out.casefold()
+    computer_type.assert_not_called()
+
+
+def test_generic_visual_configuration_reports_each_unavailable_state_safely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DirectedProvider:
+        name = "gemini"
+        model = "gemini-test-model"
+
+        def observe(self, _screenshot, _window, _request, grounding=None) -> None:
+            return None
+
+    class UndirectedProvider:
+        name = "gemini"
+        model = "gemini-test-model"
+
+        def observe(self, _screenshot, _window, _request) -> None:
+            return None
+
+    def computer(*, capture: bool = True, directed_bridge: bool = True):
+        return SimpleNamespace(
+            capture_service=object() if capture else None,
+            observe_directed=(Mock() if directed_bridge else None),
+        )
+
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    missing_provider = cli._generic_visual_configuration(
+        None, configured_provider=None, computer=computer(capture=False),
+    )
+    assert missing_provider["visual_unavailable_reason"] == "provider_missing"
+    assert missing_provider["provider_configured"] is False
+
+    missing_key = cli._generic_visual_configuration(
+        None, configured_provider="gemini", computer=computer(capture=False),
+        configuration_error=True,
+    )
+    assert missing_key["visual_unavailable_reason"] == "api_key_missing"
+    assert missing_key["api_key_present"] is False
+
+    key = "test-only-gemini-key-do-not-print"
+    monkeypatch.setenv("GEMINI_API_KEY", key)
+    missing_observer = cli._generic_visual_configuration(
+        DirectedProvider(), configured_provider="gemini",
+        computer=computer(capture=False),
+    )
+    assert missing_observer["visual_unavailable_reason"] == "observer_missing"
+    assert missing_observer["provider_configured"] is True
+    assert missing_observer["api_key_present"] is True
+
+    unsupported = cli._generic_visual_configuration(
+        UndirectedProvider(), configured_provider="gemini", computer=computer(),
+    )
+    assert unsupported["visual_unavailable_reason"] == "directed_grounding_unsupported"
+    assert unsupported["visual_observer_present"] is True
+    assert unsupported["directed_grounding_supported"] is False
+
+    configured = cli._generic_visual_configuration(
+        DirectedProvider(), configured_provider="gemini", computer=computer(),
+    )
+    assert configured["visual_unavailable_reason"] is None
+    assert configured["visual_observer_present"] is True
+    assert configured["directed_grounding_supported"] is True
+    assert configured["provider_configured"] is True
+    assert configured["provider_name"] == "gemini"
+    assert configured["model_name"] == "gemini-test-model"
+    assert configured["api_key_present"] is True
+    assert key not in json.dumps(configured)
+
+    disabled = cli._generic_visual_configuration(
+        DirectedProvider(), configured_provider="gemini", computer=computer(),
+        mode_enabled=False,
+    )
+    assert disabled["visual_unavailable_reason"] == "disabled_by_mode"
+
+
+def test_generic_cli_loads_dotenv_before_provider_wiring_and_reports_safe_metadata(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    class DirectedProvider:
+        name = "gemini"
+        model = "gemini-test-model"
+
+        def observe(self, _screenshot, _window, _request, grounding=None) -> None:
+            return None
+
+    key = "process-test-gemini-key"
+    (tmp_path / ".env").write_text(
+        "VISUAL_PROVIDER=gemini\n"
+        "GEMINI_API_KEY=dotenv-test-gemini-key\n"
+        "VISUAL_ACTIONS_ENABLED=false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "main.py"))
+    monkeypatch.delenv("VISUAL_PROVIDER", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", key)
+    provider = DirectedProvider()
+    factory_calls: list[tuple[str | None, str | None]] = []
+
+    def provider_factory():
+        factory_calls.append((
+            os.environ.get("VISUAL_PROVIDER"), os.environ.get("GEMINI_API_KEY"),
+        ))
+        return provider
+
+    computer = SimpleNamespace(
+        capture_service=object(), observe_directed=Mock(), visual_provider=provider,
+    )
+    result = GenericTaskDebugResult(False, "diagnostic_stop", "stopped", 1)
+
+    class FakeGenericAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            self.computer = args[0]
+
+        def run(self, _request: str) -> GenericTaskDebugResult:
+            assert self.computer is computer
+            return result
+
+    monkeypatch.setattr(cli, "visual_provider_from_environment", provider_factory)
+    monkeypatch.setattr(cli, "WindowsApplicationCatalog", Mock(return_value=MemoryApplicationCatalog(())))
+    monkeypatch.setattr(cli, "WindowsWindowCapture", Mock(return_value=object()))
+    monkeypatch.setattr(cli, "WindowsComputer", Mock(return_value=computer))
+    monkeypatch.setattr(cli.JevDecisionMaker, "from_environment", Mock(return_value=Mock(min_confidence=.8)))
+    monkeypatch.setattr(cli, "GenericTaskDebugAgent", FakeGenericAgent)
+    monkeypatch.setattr("builtins.input", lambda: "yes")
+
+    assert cli.main(["run-agent-generic-debug", "request", "--delay", "0"]) == 1
+
+    assert factory_calls == [("gemini", key)]
+    captured = capsys.readouterr()
+    diagnostic = json.loads(captured.out)["visual_configuration"]
+    assert diagnostic == {
+        "visual_observer_present": True,
+        "directed_grounding_supported": True,
+        "provider_configured": True,
+        "provider_name": "gemini",
+        "model_name": "gemini-test-model",
+        "api_key_present": True,
+        "visual_unavailable_reason": None,
+    }
+    assert key not in captured.out + captured.err
+    assert "dotenv-test-gemini-key" not in captured.out + captured.err
+
+
+def test_generic_cli_reports_missing_gemini_key_without_running_the_agent(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path,
+) -> None:
+    monkeypatch.setattr(cli, "__file__", str(tmp_path / "main.py"))
+    monkeypatch.setenv("VISUAL_PROVIDER", "gemini")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("VISUAL_ACTIONS_ENABLED", "false")
+    monkeypatch.setattr(cli, "WindowsApplicationCatalog", Mock(return_value=MemoryApplicationCatalog(())))
+    computer_type = Mock(side_effect=AssertionError("must stop before desktop setup"))
+    agent_factory = Mock(side_effect=AssertionError("must stop before agent construction"))
+    monkeypatch.setattr(cli, "WindowsComputer", computer_type)
+    monkeypatch.setattr(cli, "GenericTaskDebugAgent", agent_factory)
+
+    assert cli.main(["run-agent-generic-debug", "request"]) == 1
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.err)
+    assert payload["visual_configuration"]["provider_configured"] is True
+    assert payload["visual_configuration"]["provider_name"] == "gemini"
+    assert payload["visual_configuration"]["model_name"] is None
+    assert payload["visual_configuration"]["api_key_present"] is False
+    assert payload["visual_configuration"]["visual_unavailable_reason"] == "api_key_missing"
+    assert "GEMINI_API_KEY" not in captured.err
+    computer_type.assert_not_called()
+    agent_factory.assert_not_called()

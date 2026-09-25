@@ -54,6 +54,17 @@ class VisualRequestFingerprint:
 
 
 @dataclass(frozen=True, slots=True)
+class VisualProviderAttempt:
+    """Safe, bounded diagnostic for one remote visual provider attempt."""
+
+    provider: str
+    model: str
+    elapsed_ms: int
+    result_class: str
+    error_category: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Rect:
     """UIA screen bounds for observation only; negative coordinates are valid."""
 
@@ -80,6 +91,7 @@ class UIElement:
     observed_text_truncated: bool = False
     parent_name: str = ""
     parent_control_type: str = ""
+    selected: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -215,6 +227,7 @@ class VisualElement:
     clickable: bool
     parent: str = ""
     source: str = "visual"
+    activity: str | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -225,6 +238,23 @@ class ProviderErrorDiagnostic:
     http_status: int | None = None
     provider_code: str | None = None
     message: str = "Remote visual provider request failed."
+    provider_name: str | None = None
+    provider_model: str | None = None
+    provider_error_type: str | None = None
+    provider_request_id: str | None = None
+    provider_error_category: str | None = None
+    # Canonical names shared with the voice/STT provider diagnostics. The
+    # older aliases above remain for existing visual-provider callers.
+    provider_status_code: int | None = None
+    provider_error_code: str | None = None
+
+    def __post_init__(self) -> None:
+        status = self.http_status if self.http_status is not None else self.provider_status_code
+        error_code = self.provider_code if self.provider_code is not None else self.provider_error_code
+        object.__setattr__(self, "http_status", status)
+        object.__setattr__(self, "provider_status_code", status)
+        object.__setattr__(self, "provider_code", error_code)
+        object.__setattr__(self, "provider_error_code", error_code)
 
     def __eq__(self, other: object) -> bool:
         # Preserve compatibility with callers that previously compared the string code.
@@ -233,8 +263,14 @@ class ProviderErrorDiagnostic:
         if isinstance(other, ProviderErrorDiagnostic):
             return (
                 self.category, self.http_status, self.provider_code, self.message,
+                self.provider_name, self.provider_model, self.provider_error_type,
+                self.provider_request_id, self.provider_error_category,
+                self.provider_status_code, self.provider_error_code,
             ) == (
                 other.category, other.http_status, other.provider_code, other.message,
+                other.provider_name, other.provider_model, other.provider_error_type,
+                other.provider_request_id, other.provider_error_category,
+                other.provider_status_code, other.provider_error_code,
             )
         return NotImplemented
 
@@ -264,6 +300,10 @@ class Observation:
     visual_pricing_class: str | None = None
     visual_execution_authorized: bool = False
     visual_provider_error: ProviderErrorDiagnostic | None = None
+    visual_provider_attempts: tuple[VisualProviderAttempt, ...] = ()
+    selected_visual_provider: str | None = None
+    provider_failover_used: bool = False
+    provider_failover_reason: str | None = None
     screenshot_capture_ms: int | None = None
     visual_request_build_ms: int | None = None
     visual_response_parse_ms: int | None = None
