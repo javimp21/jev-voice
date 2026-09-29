@@ -1207,6 +1207,27 @@ replan by default after a valid but incomplete post-action observation;
 `--max-replans` accepts only values from 0 through 10 and never repeats an
 action automatically.
 
+Each LangGraph run emits privacy-limited `run_started`, `node_completed`, and
+`run_completed` events to `.local/agent-telemetry.jsonl`. The JSONL contains
+node timing, transition/action categories, completion metadata, and provider
+timing where available; it excludes commands, typed text, observations, prompts,
+screenshots, and coordinates. A collector can be injected for tests or other
+local sinks. `.local/` is gitignored.
+
+Run the fake-only evaluation suite without launching Windows apps or calling
+Jev/visual providers:
+
+```powershell
+python main.py eval-agent
+python main.py eval-agent --json
+```
+
+The initial deterministic scenarios cover app launch success, safety and
+executor failures, bounded replanning, snapshot binding, finish, max steps,
+and invalid decisions. The report includes scenario pass rate, average steps
+and replans, stop-reason distribution, and node transition counts. Evaluation
+does not emit the agent's runtime JSONL file.
+
 ## Local FastAPI service
 
 The experimental LangGraph runtime can also be called through a small local
@@ -1233,6 +1254,36 @@ Invoke-RestMethod http://127.0.0.1:8000/agent/run -Method Post -ContentType "app
 
 The HTTP service has no authentication layer yet and is intended to stay bound
 to the local machine unless a separate deployment design is added.
+
+## Local MCP tool server
+
+The MCP boundary is separate from both the CLI and FastAPI service. It exposes
+`observe`, `open_app`, `click`, `type_text`, and `press_key`, mapping each write
+tool to the existing typed computer action and safety policy. `observe` returns
+at most 40 redacted UIA control summaries without values or geometry. Click,
+typing, and key calls must include the exact `observation_id` returned by the
+latest `observe`; a write consumes that snapshot and obtains one fresh local
+observation afterward. Consequential actions that need confirmation are
+reported as requiring confirmation and are not executed.
+
+The server uses the official MCP Python SDK and stdio, so it has no network
+listener. From the project directory, run:
+
+```powershell
+.\.venv\Scripts\python.exe mcp_server.py
+```
+
+An MCP client first calls `observe` with no arguments. It can then pass the
+returned snapshot ID and one visible control ID to `click`:
+
+```json
+{"method":"tools/call","params":{"name":"observe","arguments":{}}}
+{"method":"tools/call","params":{"name":"click","arguments":{"observation_id":"<id from observe>","target_id":"c3"}}}
+```
+
+No screenshot provider, Jev, LangGraph, or FastAPI route is invoked by this MCP
+server. The tool service can be embedded or called in-process later; graph
+integration is intentionally not wired in this milestone.
 
 ## One-shot voice input
 

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import time
 from typing import Literal, TypedDict
+from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 
@@ -28,10 +30,58 @@ from decision.interfaces import DecisionMaker
 from decision.models import DecisionResult
 from safety.interfaces import ActionPolicy, Confirmation, SafetyDecision
 from safety.policy import BasicActionPolicy
+from agent.telemetry import (
+    AgentTelemetryEvent, JsonlTelemetrySink, TelemetryCollector, utc_timestamp,
+)
 
 
 GraphOutcome = Literal["continue", "success", "failure", "pending"]
 RecoverableVerificationReason = Literal["post_action_observation_incomplete"]
+
+_TELEMETRY_VALUES = frozenset({
+    "action_executed", "action_failed", "confidence_below_threshold",
+    "confirmation_declined", "confirmation_exception", "confirmation_required",
+    "confirmation_unavailable", "continue_after_fresh_observation",
+    "decision_after_replan", "decision_error", "decision_exception",
+    "decision_needs_human", "decision_ready", "decision_retry_exception",
+    "dry_run_proposal", "execution_exception", "execution_failed",
+    "finish_action", "finished", "fresh_snapshot_missing",
+    "graph_execution_failed", "interrupted", "invalid_action_result",
+    "invalid_action_snapshot_binding", "invalid_decision_result",
+    "invalid_decision_status", "invalid_execution_input", "invalid_finish_action",
+    "invalid_observation", "invalid_policy_result", "invalid_request",
+    "invalid_retry_result", "invalid_safety_input", "low_confidence",
+    "max_steps_reached", "max_steps", "missing_fresh_observation",
+    "missing_observation", "missing_or_invalid_action", "needs_human",
+    "node_exception", "observation_complete", "observation_exception",
+    "observation_failed", "observation_reported_error", "policy_denied",
+    "policy_exception", "post_action_observation_complete",
+    "post_action_observation_exception", "post_action_observation_incomplete",
+    "recoverable_post_action_observation", "repeated_action",
+    "replan_budget_exhausted", "replan_precondition_failed", "replan_requested",
+    "replan_started", "replan_to_decide", "safety_allowed", "safety_rejected",
+    "settle_wait_failed", "task_finished", "unknown",
+})
+_TELEMETRY_PROVIDERS = frozenset({"openai", "gemini", "openrouter", "deepseek"})
+
+
+def _safe_telemetry_value(value: object) -> str | None:
+    return value if isinstance(value, str) and value in _TELEMETRY_VALUES else None
+
+
+def _safe_int(value: object, maximum: int = 100_000) -> int | None:
+    return value if type(value) is int and 0 <= value <= maximum else None
+
+
+def _safe_latency(value: object) -> int | None:
+    return _safe_int(value, 600_000)
+
+
+def _safe_visual_provider(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    candidate = value.casefold()
+    return candidate if candidate in _TELEMETRY_PROVIDERS else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,24 +199,57 @@ class GraphAgent:
     limits: AgentLimits = AgentLimits()
     max_replans: int = 1
     sleep_fn: Callable[[float], None] | None = None
+    telemetry_collector: TelemetryCollector | None = None
 
     def __post_init__(self) -> None:
         if type(self.max_replans) is not int or not 0 <= self.max_replans <= 10:
             raise ValueError("max_replans must be an integer between 0 and 10")
 
     def run(self, request: str, *, dry_run: bool = False) -> GraphAgentResult:
+        run_id = uuid4().hex
+        started_at = utc_timestamp()
+        run_started = time.perf_counter()
+        collector = (
+            self.telemetry_collector
+            if self.telemetry_collector is not None else JsonlTelemetrySink()
+        )
+
+        def emit(event: AgentTelemetryEvent) -> None:
+            try:
+                collector.emit(event)
+            except Exception:
+                # Telemetry is a side channel and must never change agent behavior.
+                pass
+
+        emit(AgentTelemetryEvent(
+            event_type="run_started", run_id=run_id, timestamp=started_at,
+            started_at=started_at,
+        ))
+
+        def completed(result: GraphAgentResult) -> GraphAgentResult:
+            ended_at = utc_timestamp()
+            emit(AgentTelemetryEvent(
+                event_type="run_completed", run_id=run_id, timestamp=ended_at,
+                started_at=started_at, ended_at=ended_at,
+                total_duration_ms=max(0, round((time.perf_counter() - run_started) * 1000)),
+                success=result.result.success,
+                stop_reason=_safe_telemetry_value(result.result.stop_reason),
+                steps=result.result.steps, replan_count=result.replan_count,
+                max_replans=result.max_replans,
+            ))
+            return result
+
         if not isinstance(request, str) or not request.strip():
             result = AgentResult(
                 False, "invalid_request", "A non-empty request is required.",
             )
-            return GraphAgentResult(
+            return completed(GraphAgentResult(
                 result, (), "invalid_request", 0, self.max_replans, None,
-            )
+            ))
 
         policy = self.policy or BasicActionPolicy()
         sleep_fn = self.sleep_fn
         if sleep_fn is None:
-            import time
             sleep_fn = time.sleep
         set_request = getattr(self.computer, "set_observation_request", None)
         if callable(set_request):
@@ -174,6 +257,101 @@ class GraphAgent:
 
         repeat_guard = _RepeatGuard(self.limits)
         history_limit = self.limits.history_limit
+
+        def instrument_node(
+            node: str,
+            function: Callable[[AgentState], dict[str, object]],
+        ) -> Callable[[AgentState], dict[str, object]]:
+            def invoke(state: AgentState) -> dict[str, object]:
+                started = time.perf_counter()
+                update: dict[str, object] | None = None
+                failed = False
+                try:
+                    update = function(state)
+                    return update
+                except BaseException:
+                    failed = True
+                    raise
+                finally:
+                    elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+                    diagnostics = (
+                        update.get("diagnostics") if update is not None
+                        else state.get("diagnostics", ())
+                    )
+                    diagnostic = next(
+                        (item for item in reversed(diagnostics or ()) if item.node == node),
+                        None,
+                    )
+                    observation = (
+                        update.get("observation") if update is not None else None
+                    ) or state.get("observation")
+                    action = (
+                        update.get("action") if update is not None and "action" in update
+                        else state.get("action")
+                    )
+                    action_kind = _action_kind(action) if _is_action(action) else None
+                    transition = (
+                        update.get("transition_reason") if update is not None
+                        else None
+                    ) or (diagnostic.transition_reason if diagnostic is not None else None)
+                    if failed:
+                        transition = "node_exception"
+                    node_success = (
+                        False if failed else (
+                            update.get("success") if update is not None and "success" in update
+                            else diagnostic.success if diagnostic is not None else None
+                        )
+                    )
+                    stop_reason = (
+                        update.get("stop_reason") if update is not None
+                        else None
+                    ) or (diagnostic.stop_reason if diagnostic is not None else None)
+                    verdict = (
+                        update.get("verdict") if update is not None and "verdict" in update
+                        else state.get("verdict")
+                    )
+                    safety_outcome = getattr(verdict, "disposition", None)
+                    if node == "SAFETY_CHECK" and safety_outcome not in {"allow", "deny", "confirm"}:
+                        safety_outcome = (
+                            "dry_run" if transition == "dry_run_proposal"
+                            else "rejected" if node_success is False else "unavailable"
+                        )
+                    observation_complete = None
+                    provider_used = None
+                    provider_latency_ms = None
+                    if isinstance(observation, Observation):
+                        observation_complete = bool(
+                            observation.error is None
+                            and not observation.truncated
+                            and observation.inspection_errors == 0
+                        )
+                        provider_used = _safe_visual_provider(
+                            observation.selected_visual_provider or observation.visual_provider,
+                        )
+                        provider_latency_ms = _safe_latency(observation.visual_latency_ms)
+                    emit(AgentTelemetryEvent(
+                        event_type="node_completed", run_id=run_id,
+                        timestamp=utc_timestamp(), node=node,
+                        step=_safe_int(
+                            update.get("step") if update is not None else state.get("step"),
+                        ), duration_ms=elapsed_ms,
+                        transition_reason=_safe_telemetry_value(transition),
+                        action_kind=action_kind,
+                        success=node_success if isinstance(node_success, bool) else None,
+                        stop_reason=_safe_telemetry_value(stop_reason),
+                        observation_complete=observation_complete,
+                        provider_used=provider_used,
+                        provider_latency_ms=provider_latency_ms,
+                        recoverable_failure=(
+                            diagnostic.failure_recoverable if diagnostic is not None else None
+                        ),
+                        safety_outcome=(
+                            safety_outcome if safety_outcome in {
+                                "allow", "deny", "confirm", "dry_run", "rejected", "unavailable",
+                            } else None
+                        ),
+                    ))
+            return invoke
 
         def observe(state: AgentState) -> dict[str, object]:
             try:
@@ -620,15 +798,15 @@ class GraphAgent:
             } else "FAIL"
 
         builder = StateGraph(AgentState)
-        builder.add_node("OBSERVE", observe)
-        builder.add_node("DECIDE", decide)
-        builder.add_node("SAFETY_CHECK", safety_check)
-        builder.add_node("EXECUTE", execute)
-        builder.add_node("REOBSERVE", reobserve)
-        builder.add_node("VERIFY_OR_CONTINUE", verify_or_continue)
-        builder.add_node("REPLAN", replan)
-        builder.add_node("FINISH", finish)
-        builder.add_node("FAIL", fail)
+        builder.add_node("OBSERVE", instrument_node("OBSERVE", observe))
+        builder.add_node("DECIDE", instrument_node("DECIDE", decide))
+        builder.add_node("SAFETY_CHECK", instrument_node("SAFETY_CHECK", safety_check))
+        builder.add_node("EXECUTE", instrument_node("EXECUTE", execute))
+        builder.add_node("REOBSERVE", instrument_node("REOBSERVE", reobserve))
+        builder.add_node("VERIFY_OR_CONTINUE", instrument_node("VERIFY_OR_CONTINUE", verify_or_continue))
+        builder.add_node("REPLAN", instrument_node("REPLAN", replan))
+        builder.add_node("FINISH", instrument_node("FINISH", finish))
+        builder.add_node("FAIL", instrument_node("FAIL", fail))
         builder.set_entry_point("OBSERVE")
         for node in (
             "OBSERVE", "DECIDE", "SAFETY_CHECK", "EXECUTE", "REOBSERVE",
@@ -687,12 +865,12 @@ class GraphAgent:
             last_decision=last_decision,
         )
         transition_reason = final_state.get("transition_reason", "unknown")
-        return GraphAgentResult(
+        return completed(GraphAgentResult(
             result, diagnostics, transition_reason,
             replan_count=final_state.get("replan_count", 0),
             max_replans=final_state.get("max_replans", self.max_replans),
             last_replan_reason=final_state.get("last_replan_reason"),
-        )
+        ))
 
 
 def _stop_update(

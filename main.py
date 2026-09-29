@@ -23,6 +23,8 @@ from agent.hybrid_debug import (
 from agent.generic_task import (
     GenericTaskBudgets, GenericTaskDebugAgent, GenericVisualDebugScreenshotDiagnostic,
 )
+from agent.evals import format_eval_report, run_evaluations
+from agent.telemetry import JsonlTelemetrySink
 from computer.actions import ClickAction, OpenAppAction, PressKeyAction, TypeAction
 from computer.applications import ApplicationCandidate
 from computer.windows_actions import LiteralInputFailure, WindowsComputer, debug_type_literal
@@ -346,6 +348,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     graph_agent.add_argument("--max-controls", type=int, default=80)
     graph_agent.add_argument("--max-observed-text-length", type=int, default=500)
     graph_agent.add_argument("--delay", type=float, default=0)
+    eval_agent = commands.add_parser(
+        "eval-agent", help="Run deterministic offline evaluations of the LangGraph runtime",
+    )
+    eval_agent.add_argument("--json", action="store_true", help="Print the full evaluation report as JSON")
     generic_agent = commands.add_parser(
         "run-agent-generic-debug",
         help="Experimentally activate one generic target with bounded optional search",
@@ -475,6 +481,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         parser.print_help()
         return 0
+    if args.command == "eval-agent":
+        report = run_evaluations()
+        if args.json:
+            print(json.dumps(asdict(report), indent=2, ensure_ascii=True))
+        else:
+            print(format_eval_report(report))
+        return 0 if report.failed == 0 else 1
     voice_diagnostics: dict[str, object] | None = None
     voice_ready_at: float | None = None
     if args.command in {"voice-transcribe", "run-agent-voice-debug"}:
@@ -996,6 +1009,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 confidence_threshold=float(getattr(decision_maker, "min_confidence", 0.8)),
             ),
             max_replans=args.max_replans,
+            telemetry_collector=JsonlTelemetrySink(),
         )
         try:
             graph_result = agent.run(args.request, dry_run=args.dry_run)

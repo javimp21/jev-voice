@@ -82,6 +82,7 @@ dist/
 logs/
 *.log
 *.log.*
+.local/
 
 # IDE and operating-system metadata
 .idea/
