@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import sys
 from types import SimpleNamespace
@@ -12,8 +12,10 @@ from unittest.mock import Mock, PropertyMock
 import pytest
 
 from computer import windows
-from computer.models import Observation, Rect
+from computer.models import Observation, Rect, ScreenshotMetadata, UIElement, VisualElement
+from computer.visual import ScreenshotCapture, VisualFieldValueRead, VisualObservation
 from computer.windows import ObservationOptions, WindowsObserver
+from computer.windows_actions import WindowsComputer
 from main import main
 
 
@@ -87,9 +89,114 @@ def test_serialization_and_window_metadata(monkeypatch: pytest.MonkeyPatch) -> N
         }, "enabled": False, "visible": True, "focused": None, "is_password": None,
         "observed_text": None, "observed_text_truncated": False,
         "parent_name": "Editor 世界", "parent_control_type": "Window",
+        "selected": None,
     }]
     assert not result.truncated
     assert result.inspection_errors == 0
+
+
+def test_value_reader_sends_only_fresh_locally_bound_field_crop(monkeypatch: pytest.MonkeyPatch) -> None:
+    from PIL import Image
+
+    bounds = Rect(0, 0, 200, 100)
+    source_meta = ScreenshotMetadata("source", 77, bounds, bounds, 200, 100, 96, 96, 1, 1)
+    field = VisualElement(
+        "v1", "Search", "search field", Rect(10, 10, 100, 30), None, True,
+        activity="active", field_label="Search", field_value=None,
+        is_query_field=True, credential_risk=False,
+    )
+    source = Observation(
+        "Spotify.exe", "Spotify", process_id=42, observation_id="source",
+        application_id="app-spotify", visual_elements=(field,), screenshot=source_meta,
+    )
+
+    class CaptureService:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def current_window_bounds(self, handle):
+            assert handle == 77
+            return bounds
+
+        def capture(self, snapshot_id, expected_handle, process_name, sensitive_regions=()):
+            self.calls.append((snapshot_id, expected_handle, tuple(sensitive_regions)))
+            return ScreenshotCapture(
+                replace(source_meta, snapshot_id=snapshot_id),
+                Image.new("RGB", (200, 100), "white"),
+            )
+
+    class Provider:
+        name = "fixture"
+        model = "fixture-model"
+
+        def __init__(self) -> None:
+            self.call = None
+
+        def observe(self, screenshot, window, objective, grounding):
+            self.call = (screenshot.image.size, objective, grounding, window)
+            return VisualObservation(
+                (), "fixture", "fixture-model", 2, directed_grounding=True,
+                field_value="Californication",
+            )
+
+    capture_service = CaptureService()
+    provider = Provider()
+    computer = WindowsComputer(capture_service=capture_service, visual_provider=provider)
+    computer._session = SimpleNamespace(
+        observation=source, handle=77,
+        root=SimpleNamespace(identity=SimpleNamespace(process_id=42)),
+    )
+    monkeypatch.setattr(computer, "_check_window", lambda _session: None)
+
+    result = computer.read_visual_field_value(source, field.id)
+
+    assert isinstance(result, VisualFieldValueRead)
+    assert result.field_value == "Californication"
+    assert result.crop_valid and result.context_stable and result.credential_safe
+    assert len(capture_service.calls) == 1
+    assert capture_service.calls[0][0] != source.observation_id
+    assert provider.call is not None
+    crop_size, objective, grounding, passed_window = provider.call
+    assert crop_size == (94, 24)
+    assert grounding.field_value_only is True
+    assert "Search" not in objective and "Californication" not in objective
+    assert passed_window is source
+
+
+def test_value_reader_refuses_unbound_snapshot_and_password_risk(monkeypatch: pytest.MonkeyPatch) -> None:
+    bounds = Rect(0, 0, 200, 100)
+    metadata = ScreenshotMetadata("source", 77, bounds, bounds, 200, 100, 96, 96, 1, 1)
+    field = VisualElement(
+        "v1", "Search", "search field", Rect(10, 10, 100, 30), None, True,
+        activity="active", is_query_field=True, credential_risk=False,
+    )
+    source = Observation(
+        "Spotify.exe", "Spotify", process_id=42, observation_id="source",
+        application_id="app-spotify", visual_elements=(field,), screenshot=metadata,
+    )
+    capture_service = Mock()
+    capture_service.current_window_bounds.return_value = bounds
+    provider = Mock()
+    computer = WindowsComputer(capture_service=capture_service, visual_provider=provider)
+    computer._session = SimpleNamespace(
+        observation=replace(source), handle=77,
+        root=SimpleNamespace(identity=SimpleNamespace(process_id=42)),
+    )
+
+    unbound = computer.read_visual_field_value(source, field.id)
+    assert not unbound.crop_valid and not unbound.context_stable
+    capture_service.capture.assert_not_called()
+
+    password = replace(source, elements=(UIElement(
+        "c1", "Password", "Edit", rectangle=Rect(10, 10, 100, 30),
+        visible=True, is_password=True,
+    ),))
+    computer._session.observation = password
+    monkeypatch.setattr(computer, "_check_window", lambda _session: None)
+    blocked = computer.read_visual_field_value(password, field.id)
+    assert blocked.credential_safe is False
+    assert blocked.reason == "credential_control_present"
+    capture_service.capture.assert_not_called()
 
 
 def test_observation_includes_best_effort_process_name(monkeypatch: pytest.MonkeyPatch) -> None:

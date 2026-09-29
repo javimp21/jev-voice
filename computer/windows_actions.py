@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 import math
 import time
 from typing import Any, Literal
+from uuid import uuid4
 
 from computer.actions import (
     Action, ClickAction, FinishAction, OpenAppAction, PressKeyAction, QuerySubmitAction,
@@ -25,8 +26,9 @@ from computer.windows import (
     ObservationOptions, WindowsObserver, _foreground, _redact_observed_text,
 )
 from computer.visual import (
-    ScreenCapture, ScreenshotCapture, VisualGroundingRequest, VisualObserver,
+    ScreenCapture, ScreenshotCapture, VisualFieldValueRead, VisualGroundingRequest, VisualObserver,
     VisualProviderFailure, VisualReadinessOptions,
+    crop_screenshot_to_field,
     validate_visual_candidates_detailed,
     visual_click_point, visual_readiness_frame, visual_rect_to_screen,
 )
@@ -167,14 +169,17 @@ def _visual_click_geometry_diagnostics(
     distances: list[float] = []
     overlap = False
     for neighbor in neighbors:
+        intersects = (
+            screen_rect.left < neighbor.right and screen_rect.right > neighbor.left
+            and screen_rect.top < neighbor.bottom and screen_rect.bottom > neighbor.top
+        )
+        overlap = overlap or intersects
         dx = max(screen_rect.left - neighbor.right, neighbor.left - screen_rect.right, 0)
         dy = max(screen_rect.top - neighbor.bottom, neighbor.top - screen_rect.bottom, 0)
-        if dx == 0 and dy == 0:
-            overlap = True
         distances.append(math.hypot(dx, dy))
     nearest = min(distances) if distances else None
     distance_bucket = (
-        None if nearest is None else "overlap" if nearest == 0 else
+        None if nearest is None else "overlap" if overlap and nearest == 0 else
         "touching" if nearest <= 6 else "near" if nearest <= 24 else
         "moderate" if nearest <= 80 else "far"
     )
@@ -392,6 +397,129 @@ class WindowsComputer(WindowsObserver):
             self.visual_provider = provider
             self.visual_grounding = grounding
 
+    def read_visual_field_value(
+        self, observation: Observation, field_id: str,
+    ) -> VisualFieldValueRead:
+        """Read one value from a fresh, locally cropped image of a bound query field."""
+        session = self._session
+        provider = self.visual_provider
+        metadata = observation.screenshot
+        field = next((item for item in observation.visual_elements if item.id == field_id), None)
+        if (session is None or session.observation is not observation or provider is None
+                or self.capture_service is None or metadata is None
+                or metadata.snapshot_id != observation.observation_id
+                or metadata.window_handle != session.handle
+                or observation.process_id != session.root.identity.process_id
+                or field is None or field.source != "visual"
+                or field.is_query_field is not True or field.activity != "active"
+                or field.credential_risk is not False):
+            return VisualFieldValueRead(reason="field_binding_unavailable")
+
+        capture: ScreenshotCapture | None = None
+        crop: ScreenshotCapture | None = None
+        attempts: tuple[VisualProviderAttempt, ...] = ()
+        try:
+            self._check_window(session)
+            bounds = self.capture_service.current_window_bounds(session.handle)
+            if bounds != metadata.window_bounds:
+                return VisualFieldValueRead(reason="window_geometry_changed")
+            sensitive = tuple(
+                control.rectangle for control in observation.elements
+                if control.visible is not False and control.is_password is True
+                and isinstance(control.rectangle, Rect)
+            )
+            if sensitive:
+                return VisualFieldValueRead(
+                    context_stable=True, credential_safe=False,
+                    reason="credential_control_present",
+                )
+            snapshot_id = uuid4().hex
+            capture = self.capture_service.capture(
+                snapshot_id, session.handle, observation.app_name, sensitive,
+            )
+            if (capture.metadata.snapshot_id != snapshot_id
+                    or capture.metadata.window_handle != session.handle
+                    or capture.metadata.window_bounds != metadata.window_bounds
+                    or capture.metadata.capture_bounds != metadata.capture_bounds
+                    or (capture.metadata.pixel_width, capture.metadata.pixel_height)
+                    != (metadata.pixel_width, metadata.pixel_height)):
+                return VisualFieldValueRead(
+                    context_stable=False, credential_safe=True,
+                    reason="fresh_capture_geometry_mismatch",
+                )
+            self._check_window(session)
+            if self.capture_service.current_window_bounds(session.handle) != metadata.window_bounds:
+                return VisualFieldValueRead(
+                    context_stable=False, credential_safe=True,
+                    reason="window_geometry_changed",
+                )
+            crop = crop_screenshot_to_field(capture, field.rectangle, sensitive_regions=sensitive)
+            grounding = VisualGroundingRequest(
+                "Read the current visible value inside the supplied text field crop.",
+                max_elements=1, verification_only=True,
+                query_field_continuity=True, field_value_only=True,
+            )
+            result = provider.observe(crop, observation, grounding.objective, grounding)
+            attempts = result.provider_attempts
+            if not attempts:
+                attempts = (VisualProviderAttempt(
+                    result.provider[:40], result.model[:100], max(0, result.latency_ms or 0),
+                    "value_read_success" if result.field_value is not None else "value_read_empty",
+                ),)
+            self._check_window(session)
+            if self.capture_service.current_window_bounds(session.handle) != metadata.window_bounds:
+                return VisualFieldValueRead(
+                    crop_valid=True, context_stable=False, credential_safe=True,
+                    provider_attempts=attempts, reason="context_changed_during_read",
+                )
+            if result.execution_authorized or not result.directed_grounding:
+                return VisualFieldValueRead(
+                    crop_valid=True, context_stable=True, credential_safe=True,
+                    provider_attempts=attempts, reason="invalid_value_read_response",
+                )
+            return VisualFieldValueRead(
+                result.field_value, True, True, True, attempts,
+            )
+        except KeyboardInterrupt:
+            raise
+        except PermissionError:
+            return VisualFieldValueRead(
+                crop_valid=False, context_stable=True, credential_safe=False,
+                provider_attempts=attempts, reason="credential_region_overlaps_crop",
+            )
+        except ValueError:
+            return VisualFieldValueRead(
+                crop_valid=False, context_stable=True, credential_safe=True,
+                provider_attempts=attempts, reason="crop_invalid",
+            )
+        except VisualProviderFailure as exc:
+            attempts = exc.provider_attempts or (VisualProviderAttempt(
+                (exc.diagnostic.provider_name or getattr(provider, "name", "provider"))[:40],
+                (exc.diagnostic.provider_model or getattr(provider, "model", ""))[:100],
+                0, "provider_failure",
+                exc.diagnostic.provider_error_category,
+            ),)
+            return VisualFieldValueRead(
+                crop_valid=crop is not None, context_stable=True, credential_safe=True,
+                provider_attempts=attempts,
+                error=exc.diagnostic, reason="provider_failure",
+            )
+        except Exception as exc:
+            return VisualFieldValueRead(
+                crop_valid=crop is not None, context_stable=False, credential_safe=None,
+                provider_attempts=attempts, reason="value_read_unavailable",
+            )
+        finally:
+            if crop is not None:
+                crop.discard()
+            if capture is not None:
+                capture.discard()
+
+    def observe_preclick_local(self, expected_context: Observation) -> Observation:
+        """Take a fresh local UIA snapshot before authorizing a visual target click."""
+        del expected_context  # Context is verified immediately after the read by the agent.
+        return self.observe_local()
+
     def activation_target_probe(
         self, candidate: ApplicationCandidate,
     ) -> Callable[[], TrustedApplicationRuntimeState] | None:
@@ -425,6 +553,20 @@ class WindowsComputer(WindowsObserver):
             return self.observe()
         finally:
             self.visual_grounding = previous
+
+    def observe_preclick_directed(
+        self, grounding: VisualGroundingRequest, expected_context: Observation,
+    ) -> Observation:
+        """Ground once against a fresh capture only while the expected window stays foreground."""
+        previous_expected = self._expected_visual_context
+        previous_force_capture = self.force_capture
+        self._expected_visual_context = expected_context
+        self.force_capture = True
+        try:
+            return self.observe_directed(grounding)
+        finally:
+            self._expected_visual_context = previous_expected
+            self.force_capture = previous_force_capture
 
     def activation_postcondition_context_matches(
         self, before: Observation, after: Observation,

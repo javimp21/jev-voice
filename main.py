@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import sys
 import time
+from typing import TYPE_CHECKING
 
 from dotenv import load_dotenv
 
@@ -27,6 +28,7 @@ from computer.applications import ApplicationCandidate
 from computer.windows_actions import LiteralInputFailure, WindowsComputer, debug_type_literal
 from computer.windows import ObservationOptions, WindowsObserver
 from computer.windows_apps import WindowsApplicationCatalog
+from computer.packaged_activation_diagnostic import run_packaged_activation_diagnostic
 from computer.windows_capture import WindowsWindowCapture, save_debug_overlay, save_debug_screenshot
 from computer.visual import (
     ResultReadinessOptions, VisualReadinessOptions, bounded_grounding_request,
@@ -50,6 +52,9 @@ from safety.policy import (
 )
 from voice.models import VoiceInputError
 from voice.service import voice_input_from_environment
+
+if TYPE_CHECKING:
+    from agent.graph import GraphAgentResult
 
 
 _VISUAL_PROVIDER_KEY_VARIABLES = {
@@ -181,6 +186,33 @@ def _safe_agent_result(result: AgentResult) -> dict[str, object]:
     }
 
 
+def _safe_graph_agent_result(graph_result: "GraphAgentResult") -> dict[str, object]:
+    """Serialize only the graph trace metadata safe for local debug output."""
+    result = graph_result.result
+    return {
+        "success": result.success,
+        "stop_reason": result.stop_reason,
+        "message": "Graph run completed." if result.success else "Graph run stopped.",
+        "steps": result.steps,
+        "replan_count": graph_result.replan_count,
+        "max_replans": graph_result.max_replans,
+        "last_replan_reason": graph_result.last_replan_reason,
+        "history": [
+            {"success": item.success, "action_kind": item.action.kind,
+             "error": item.error if item.error in {
+                 None, "policy_blocked", "unsafe_target", "stale_observation",
+                 "windows_operation_failed", "unsupported_action",
+             } else ("other_error" if item.error else None)}
+            for item in result.history
+        ],
+        "graph": {
+            "node_sequence": [item.node for item in graph_result.diagnostics],
+            "transition_reason": graph_result.transition_reason,
+            "transitions": [asdict(item) for item in graph_result.diagnostics],
+        },
+    }
+
+
 def _save_exact_result_capture(observation, capture, path: Path) -> dict[str, object]:
     """Save only the exact masked PNG paired with one result grounding request."""
     fingerprint = observation.visual_request_fingerprint
@@ -303,6 +335,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     for command in (press_key, type_text, inspect, decide):
         command.add_argument("--delay", type=float, default=5, help="Seconds to switch to the target window (default: 5)")
     run_agent.add_argument("--delay", type=float, default=0, help="Seconds to switch to the target window")
+    graph_agent = commands.add_parser(
+        "run-agent-graph-debug",
+        help="Experimentally run the bounded agent through explicit LangGraph nodes",
+    )
+    graph_agent.add_argument("request")
+    graph_agent.add_argument("--dry-run", action="store_true", help="Propose one action without executing it")
+    graph_agent.add_argument("--max-steps", type=int, default=None)
+    graph_agent.add_argument("--max-replans", type=int, default=1)
+    graph_agent.add_argument("--max-controls", type=int, default=80)
+    graph_agent.add_argument("--max-observed-text-length", type=int, default=500)
+    graph_agent.add_argument("--delay", type=float, default=0)
     generic_agent = commands.add_parser(
         "run-agent-generic-debug",
         help="Experimentally activate one generic target with bounded optional search",
@@ -370,6 +413,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Save the exact masked PNG sent only for Phase-3 result grounding",
     )
     list_apps = commands.add_parser("list-apps", help="List trusted locally discovered applications")
+    packaged_activation = commands.add_parser(
+        "debug-packaged-activation",
+        help="Measure one trusted packaged-app launch mechanism and foreground result",
+    )
+    packaged_activation.add_argument("query", help="Packaged app name from the trusted catalog")
+    packaged_activation.add_argument(
+        "--mechanism", required=True, choices=("shell", "activation-manager"),
+        help="Run exactly one mechanism in this invocation",
+    )
+    packaged_activation.add_argument("--timeout-seconds", type=float, default=8.0)
+    packaged_activation.add_argument("--poll-interval-ms", type=int, default=200)
     find_app = commands.add_parser("find-app", help="Rank installed applications for a name or request")
     find_app.add_argument("query")
     find_app.add_argument("--limit", type=int, default=10)
@@ -480,7 +534,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command in {
             "run-agent", "run-agent-hybrid-debug", "run-agent-hybrid-click-debug",
             "run-agent-hybrid-type-debug",
-            "run-agent-hybrid-result-debug",
+            "run-agent-hybrid-result-debug", "run-agent-graph-debug",
         }:
             configured_steps = args.max_steps
             if configured_steps is None:
@@ -491,6 +545,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise ValueError("AGENT_MAX_STEPS must be an integer") from exc
             if configured_steps <= 0:
                 raise ValueError("max steps must be positive")
+        if (args.command == "run-agent-graph-debug"
+                and not 0 <= args.max_replans <= 10):
+            raise ValueError("max replans must be between 0 and 10")
         if args.command in {
             "run-agent-hybrid-debug", "run-agent-hybrid-click-debug",
             "run-agent-hybrid-type-debug",
@@ -541,7 +598,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     catalog = WindowsApplicationCatalog() if args.command in {
         "list-apps", "find-app", "inspect-app", "inspect-hybrid", "inspect-hybrid-directed",
         "diagnose-visual-grounding",
-        "open-app", "decide", "run-agent", "run-agent-hybrid-debug",
+        "open-app", "debug-packaged-activation", "decide", "run-agent", "run-agent-hybrid-debug",
+        "run-agent-graph-debug",
         "run-agent-hybrid-click-debug",
         "run-agent-hybrid-type-debug",
         "run-agent-hybrid-result-debug",
@@ -554,6 +612,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     visual_provider = None
     if args.command in {
         "inspect-hybrid", "inspect-hybrid-directed", "decide", "run-agent",
+        "run-agent-graph-debug",
         "run-agent-hybrid-debug", "diagnose-visual-grounding",
         "run-agent-hybrid-click-debug",
         "run-agent-hybrid-type-debug",
@@ -893,6 +952,57 @@ def main(argv: Sequence[str] | None = None) -> int:
             result_json["voice_input"] = voice_diagnostics
         print(json.dumps(result_json, indent=2, ensure_ascii=True))
         return 0 if result.success else 1
+    if args.command == "run-agent-graph-debug":
+        try:
+            from agent.graph import GraphAgent
+        except ImportError:
+            print(json.dumps({
+                "success": False,
+                "stop_reason": "graph_dependency_unavailable",
+                "message": "Install the project dependencies to use the experimental graph command.",
+            }, indent=2), file=sys.stderr)
+            return 1
+        try:
+            decision_maker = JevDecisionMaker.from_environment(catalog)
+        except ConfigurationError:
+            print(json.dumps({
+                "success": False, "stop_reason": "decision_error",
+                "message": "Decision provider configuration is unavailable.",
+            }, indent=2), file=sys.stderr)
+            return 1
+        computer = WindowsComputer(
+            options, app_catalog=catalog,
+            capture_service=WindowsWindowCapture() if visual_provider else None,
+            visual_provider=visual_provider,
+        )
+        if not args.dry_run:
+            print(
+                "EXPERIMENTAL LANGGRAPH RUN: safety-validated Windows actions may execute. Continue? [y/N]",
+                file=sys.stderr,
+            )
+            try:
+                answer = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return 130
+            if answer not in {"y", "yes"}:
+                print("Graph run cancelled.", file=sys.stderr)
+                return 1
+        agent = GraphAgent(
+            computer,
+            decision_maker,
+            policy=AutonomousActionPolicy(catalog),
+            limits=AgentLimits(
+                max_steps=configured_steps,
+                confidence_threshold=float(getattr(decision_maker, "min_confidence", 0.8)),
+            ),
+            max_replans=args.max_replans,
+        )
+        try:
+            graph_result = agent.run(args.request, dry_run=args.dry_run)
+        except KeyboardInterrupt:
+            return 130
+        print(json.dumps(_safe_graph_agent_result(graph_result), indent=2, ensure_ascii=True))
+        return 0 if graph_result.result.success else 1
     if args.command == "run-agent":
         try:
             decision_maker = JevDecisionMaker.from_environment(catalog)
@@ -1142,6 +1252,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error": observation.error,
         }, indent=2, ensure_ascii=True))
         return 1 if observation.error else 0
+    if args.command == "debug-packaged-activation":
+        if not 0.1 <= args.timeout_seconds <= 15:
+            parser.error("timeout-seconds must be between 0.1 and 15")
+        if not 10 <= args.poll_interval_ms <= 1000:
+            parser.error("poll-interval-ms must be between 10 and 1000")
+        assert catalog is not None
+        try:
+            diagnostic = run_packaged_activation_diagnostic(
+                args.query, args.mechanism, catalog,
+                computer_factory=lambda **kwargs: WindowsComputer(options, **kwargs),
+                timeout_seconds=args.timeout_seconds,
+                poll_interval_seconds=args.poll_interval_ms / 1000,
+            )
+        except KeyboardInterrupt:
+            return 130
+        print(json.dumps(asdict(diagnostic), indent=2, ensure_ascii=True))
+        return 0 if diagnostic.success else 1
     computer = WindowsComputer(options, app_catalog=catalog)
     if args.command == "open-app":
         assert catalog is not None

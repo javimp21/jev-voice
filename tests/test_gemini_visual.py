@@ -131,9 +131,11 @@ def test_gemini_directed_grounding_is_compact_bounded_and_observation_only() -> 
     shot.discard()
 
 
-def test_gemini_activation_verification_uses_structured_activity_evidence() -> None:
+def test_gemini_activation_verification_uses_structured_active_context_evidence() -> None:
     raw = directed_element()
     raw["activity"] = "active"
+    raw["selection_state"] = "selected"
+    raw["region"] = "header"
     provider, transport = provider_with(response([raw]))
     shot = capture()
     grounding = VisualGroundingRequest(
@@ -146,13 +148,112 @@ def test_gemini_activation_verification_uses_structured_activity_evidence() -> N
     payload = transport.create.call_args.args[0]
     prompt = payload["contents"][0]["parts"][0]["text"]
     schema = payload["generationConfig"]["responseJsonSchema"]["properties"]["elements"]["items"]
-    assert "name being visible alone is never active evidence" in prompt
+    assert "a name being visible alone is never active evidence" in prompt.casefold()
     assert schema["properties"]["activity"]["enum"] == ["active", "not_active", "unknown"]
+    assert schema["properties"]["selection_state"]["enum"] == [
+        "selected", "not_selected", "unknown",
+    ]
+    assert schema["properties"]["region"]["enum"] == [
+        "navigation", "detail", "header", "content", "unknown",
+    ]
     assert "activity" in schema["required"]
+    assert "selection_state" in schema["required"] and "region" in schema["required"]
     assert result.candidates[0].activity == "active"
+    assert result.candidates[0].selection_state.value == "selected"
+    assert result.candidates[0].region.value == "header"
     assert result.execution_authorized is False
     fingerprint = provider.request_fingerprint(shot, grounding)
-    assert fingerprint is not None and fingerprint.schema_version == "2"
+    assert fingerprint is not None and fingerprint.schema_version == "3"
+    shot.discard()
+
+
+def test_gemini_query_continuity_returns_label_and_field_value_separately() -> None:
+    raw = {
+        "field_label": "¿Qué quieres reproducir?",
+        "field_value": "Californication",
+        "role": "search_field",
+        "box": {"left": 100, "top": 100, "right": 300, "bottom": 300},
+        "clickable": True,
+        "activity": "active",
+        "is_query_field": True,
+        "credential_risk": False,
+    }
+    provider, transport = provider_with(response([raw]))
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        "Verify the active query field contains Californication.", 5,
+        verification_only=True, query_field_continuity=True,
+    )
+
+    result = provider.observe(shot, Observation("", ""), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["contents"][0]["parts"][0]["text"]
+    schema = payload["generationConfig"]["responseJsonSchema"]["properties"]["elements"]["items"]
+    assert "placeholder" in prompt and "field_value separately" in prompt
+    assert "nearby results" in prompt and "search history" in prompt
+    assert set(schema["properties"]) == {
+        "field_label", "field_value", "role", "box", "clickable", "activity",
+        "is_query_field", "credential_risk",
+    }
+    assert schema["properties"]["field_label"]["type"] == ["string", "null"]
+    assert schema["properties"]["field_value"]["type"] == ["string", "null"]
+    assert result.candidates[0].field_label == "¿Qué quieres reproducir?"
+    assert result.candidates[0].field_value == "Californication"
+    assert result.candidates[0].is_query_field is True
+    assert result.candidates[0].credential_risk is False
+    shot.discard()
+
+
+def test_gemini_value_only_read_uses_strict_field_value_schema_and_prompt() -> None:
+    provider, transport = provider_with(response([]))
+    transport.create.return_value = {
+        "candidates": [{"finishReason": "STOP", "content": {"parts": [{
+            "text": json.dumps({"field_value": "Californication"}),
+        }]}}],
+    }
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+
+    result = provider.observe(shot, Observation("", ""), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["contents"][0]["parts"][0]["text"]
+    schema = payload["generationConfig"]["responseJsonSchema"]
+    assert schema["required"] == ["field_value"]
+    assert set(schema["properties"]) == {"field_value"}
+    assert "nearby results" in prompt and "Do not identify" in prompt
+    assert result.candidates == () and result.field_value == "Californication"
+    assert provider.request_fingerprint(shot, grounding).schema_version == "5"
+    shot.discard()
+
+
+def test_gemini_value_only_read_uses_strict_field_value_schema_and_prompt() -> None:
+    provider, transport = provider_with(response([]))
+    transport.create.return_value = {
+        "candidates": [{"finishReason": "STOP", "content": {"parts": [{
+            "text": json.dumps({"field_value": "Californication"}),
+        }]}}],
+    }
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+
+    result = provider.observe(shot, Observation("", ""), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["contents"][0]["parts"][0]["text"]
+    schema = payload["generationConfig"]["responseJsonSchema"]
+    assert schema["required"] == ["field_value"]
+    assert set(schema["properties"]) == {"field_value"}
+    assert "nearby results" in prompt and "Do not identify" in prompt
+    assert result.candidates == () and result.field_value == "Californication"
+    assert provider.request_fingerprint(shot, grounding).schema_version == "5"
     shot.discard()
 
 

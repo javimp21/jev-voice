@@ -14,6 +14,30 @@ class VisualGroundingStatus(StrEnum):
     HANDOFF_EMPTY = "handoff_empty"
 
 
+class VisualSelectionState(StrEnum):
+    SELECTED = "selected"
+    NOT_SELECTED = "not_selected"
+    UNKNOWN = "unknown"
+
+
+class VisualRegion(StrEnum):
+    NAVIGATION = "navigation"
+    DETAIL = "detail"
+    HEADER = "header"
+    CONTENT = "content"
+    UNKNOWN = "unknown"
+
+
+class VisualPreclickRevalidationStatus(StrEnum):
+    STABLE = "STABLE"
+    MOVED = "MOVED"
+    DISAPPEARED = "DISAPPEARED"
+    REJECTED = "REJECTED"
+    AMBIGUOUS = "AMBIGUOUS"
+    INCOMPLETE = "INCOMPLETE"
+    CONTEXT_CHANGED = "CONTEXT_CHANGED"
+
+
 class VisualReadinessReason(StrEnum):
     INITIALLY_READY = "initially_ready"
     BECAME_READY = "became_ready"
@@ -62,6 +86,63 @@ class VisualProviderAttempt:
     elapsed_ms: int
     result_class: str
     error_category: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VisualPreclickTargetSpecDiagnostic:
+    primary_identity: str
+    qualifiers: tuple[str, ...]
+    desired_role: str | None
+    action_intent: str
+
+
+@dataclass(frozen=True, slots=True)
+class VisualPreclickCandidateDiagnostic:
+    candidate_id: str
+    primary_text: str
+    secondary_text: tuple[str, ...]
+    provider_role: str | None
+    semantic_role: str | None
+    presentation_role: str
+    primary_identity_relation: str
+    qualifier_evidence: tuple[str, ...]
+    role_compatibility: str
+    presentation_compatibility: str
+    actionable: bool
+    geometry_valid: bool
+    safety_eligible: bool
+    admissible: bool
+    rejection_reasons: tuple[str, ...]
+    reached_frontier: bool
+    considered_same_target: bool
+    same_target_rejection_reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class VisualPreclickRevalidationDiagnostic:
+    """Safe, bounded diagnostics for one pre-input target revalidation."""
+
+    attempted: bool
+    original_candidate_id: str | None
+    original_snapshot_id_present: bool
+    fresh_snapshot_obtained: bool
+    trusted_context_stable: bool | None
+    same_target_found: bool
+    result: VisualPreclickRevalidationStatus
+    geometry_changed: bool | None = None
+    displacement_bucket: str | None = None
+    size_changed: bool | None = None
+    provider_attempts: tuple[VisualProviderAttempt, ...] = ()
+    rebound_to_fresh_snapshot: bool = False
+    click_released: bool = False
+    source: str | None = None
+    failure_reason: str | None = None
+    original_target: VisualPreclickTargetSpecDiagnostic | None = None
+    original_candidate: VisualPreclickCandidateDiagnostic | None = None
+    fresh_candidate_count: int = 0
+    admissible_fresh_candidate_count: int = 0
+    frontier_fresh_candidate_count: int = 0
+    fresh_candidates: tuple[VisualPreclickCandidateDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +309,12 @@ class VisualElement:
     parent: str = ""
     source: str = "visual"
     activity: str | None = None
+    selection_state: VisualSelectionState = VisualSelectionState.UNKNOWN
+    region: VisualRegion = VisualRegion.UNKNOWN
+    field_label: str | None = None
+    field_value: str | None = None
+    is_query_field: bool | None = None
+    credential_risk: bool | None = None
 
 
 @dataclass(frozen=True, slots=True, eq=False)

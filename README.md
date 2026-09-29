@@ -207,6 +207,22 @@ identity, counts by UIA control type, up to 40 named interactive controls, one
 immediate parent label/type, and only presence/length metadata for focused
 editable text. It never prints editable values or password controls.
 
+For a manual packaged-app launch comparison, run one mechanism per command.
+Close the target app before each run if you want comparable cold-launch results.
+The diagnostic resolves the app through the trusted catalog, observes locally
+through UIA, and may make one existing foreground-activation attempt only after
+the same trusted primary window is uniquely resolved and stable. It sends no
+synthetic input and does not change the production launcher.
+
+```powershell
+.\.venv\Scripts\python.exe main.py debug-packaged-activation WhatsApp --mechanism shell
+.\.venv\Scripts\python.exe main.py debug-packaged-activation WhatsApp --mechanism activation-manager
+```
+
+The output omits raw AUMIDs, process IDs, and window handles. Mocks validate the
+diagnostic logic only; real foreground behavior must be assessed from these two
+manual Windows runs.
+
 ## Hybrid visual observation
 
 UIA remains the primary source. A deterministic local policy requests visual
@@ -1168,6 +1184,55 @@ computer loop. Contracts are synchronous for now. The coordinator handles
 cancellation, errors, denied actions, and a bounded step count. The first voice
 adapter is available as a CLI input path; global-shortcut integration remains
 future work.
+
+### Experimental LangGraph runner
+
+`run-agent` continues to use the existing `Agent` loop. An incremental graph
+implementation is available separately:
+
+```powershell
+python main.py run-agent-graph-debug "..." --dry-run
+```
+
+Its explicit nodes are
+`OBSERVE -> DECIDE -> SAFETY_CHECK -> EXECUTE -> REOBSERVE ->
+VERIFY_OR_CONTINUE`, with terminal `FINISH` and `FAIL` nodes. It uses the same
+decision maker, action policy, confirmation contract, executor, confidence
+threshold, repetition guard, and step limit. A normal graph run also asks for
+an explicit `y`/`yes` before it can execute Windows actions. Safe trace output
+shows node transitions and observation IDs without request text, control
+labels, typed values, screenshots, or geometry. This is an experimental
+parallel path; the existing loop has not been migrated. The graph allows one
+replan by default after a valid but incomplete post-action observation;
+`--max-replans` accepts only values from 0 through 10 and never repeats an
+action automatically.
+
+## Local FastAPI service
+
+The experimental LangGraph runtime can also be called through a small local
+HTTP service. It does not create a second agent loop; `/agent/run` constructs
+the existing Windows/decision/safety dependencies and calls `GraphAgent.run`.
+Requests default to `dry_run: true`; `max_steps` is bounded to 1–20 and
+`max_replans` to 0–10. The service binds to loopback in the command below and
+does not expose observations, screenshots, request text, typed values,
+coordinates, or provider prompts in responses.
+
+Start it from the project directory:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn api:app --host 127.0.0.1 --port 8000
+```
+
+Check health and submit a dry-run request from another PowerShell window:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+$body = @{ command = "Open Notepad"; dry_run = $true; max_steps = 4; max_replans = 1 } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8000/agent/run -Method Post -ContentType "application/json" -Body $body
+```
+
+The HTTP service has no authentication layer yet and is intended to stay bound
+to the local machine unless a separate deployment design is added.
 
 ## One-shot voice input
 

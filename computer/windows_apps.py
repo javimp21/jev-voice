@@ -8,6 +8,7 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import re
+import time
 from typing import Any
 
 from computer.applications import (
@@ -47,6 +48,18 @@ class PackagedMetadata:
 @dataclass(frozen=True, slots=True)
 class _Binding:
     launcher: Callable[[], None]
+    packaged_aumid: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PackagedLaunchDiagnosticResult:
+    """Sanitized result of one isolated packaged-app launch request."""
+
+    request_succeeded: bool
+    request_elapsed_ms: int | None
+    returned_pid_present: bool = False
+    hresult: int | None = None
+    failure_reason: str | None = None
 
 
 def _safe_display_name(value: str) -> str:
@@ -175,7 +188,7 @@ class WindowsApplicationCatalog:
                     tuple(Path(item).name for item in metadata.process_names), metadata.package_family,
                 )
                 candidates.append(candidate)
-                self._bindings[app_id] = _Binding(metadata.launcher)
+                self._bindings[app_id] = _Binding(metadata.launcher, aumid)
             except Exception:
                 continue
         candidates.sort(key=lambda candidate: (normalize_app_name(candidate.display_name), candidate.id))
@@ -198,6 +211,45 @@ class WindowsApplicationCatalog:
         if candidate is None or binding is None or candidate.launch_policy != "allow":
             raise ValueError("Application ID is unavailable or not approved for launch.")
         binding.launcher()
+
+    def launch_packaged_for_diagnostic(
+        self,
+        app_id: str,
+        mechanism: str,
+        *,
+        activation_manager: Callable[[str], PackagedLaunchDiagnosticResult] | None = None,
+    ) -> PackagedLaunchDiagnosticResult:
+        """Run one launch mechanism using only this catalog's trusted binding.
+
+        The AUMID is kept private and passed only to the Windows COM adapter.
+        This method is for the manual A/B diagnostic and does not affect launch().
+        """
+        candidate = self.resolve(app_id)
+        binding = self._bindings.get(app_id)
+        if (candidate is None or binding is None or candidate.source != "packaged"
+                or candidate.launch_policy != "allow" or not binding.packaged_aumid):
+            raise ValueError("Application ID is unavailable for packaged activation diagnostics.")
+        if mechanism == "shell":
+            started = time.perf_counter()
+            try:
+                binding.launcher()
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                return PackagedLaunchDiagnosticResult(
+                    False, max(0, round((time.perf_counter() - started) * 1000)),
+                    failure_reason="launch_request_failed",
+                )
+            return PackagedLaunchDiagnosticResult(
+                True, max(0, round((time.perf_counter() - started) * 1000)),
+            )
+        if mechanism == "activation-manager":
+            if activation_manager is None:
+                return PackagedLaunchDiagnosticResult(
+                    False, None, failure_reason="activation_manager_unavailable",
+                )
+            return activation_manager(binding.packaged_aumid)
+        raise ValueError("Unsupported packaged activation diagnostic mechanism.")
 
     def identify(self, process_name: str, package_family: str = "") -> str | None:
         process = Path(process_name).name.casefold()

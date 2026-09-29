@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,7 +13,10 @@ from agent.generic_task import (
     _ReadinessAssessment, _RunBudget, decompose_generic_task,
     wait_for_local_transition,
 )
-from agent.activation_postcondition import ActivationPostconditionResult
+from agent.activation_postcondition import (
+    ActivationEvidence, ActivationPostconditionResult,
+    evaluate_target_activation_postcondition,
+)
 from computer.actions import (
     ClickAction, OpenAppAction, QuerySubmitAction, TypeAction, VisualClickAction,
 )
@@ -23,9 +27,10 @@ from computer.applications import (
 from computer.models import (
     Observation, ProviderErrorDiagnostic, Rect, ScreenshotMetadata, UIElement, VisualElement,
     VisualProviderAttempt,
-    VisualGroundingStatus, VisualPipelineDiagnostic,
+    VisualGroundingStatus, VisualPipelineDiagnostic, VisualRegion, VisualSelectionState,
 )
 from computer.results import ActionResult, VisualActivationDiagnostic
+from computer.visual import VisualFieldValueRead
 from decision.context import requested_target_spec
 from decision.models import TargetChoiceResult
 from decision.target_resolution import (
@@ -103,9 +108,11 @@ class FakeComputer:
         self.directed = list(directed or [])
         self.visual_provider = visual_provider
         self.directed_calls = []
+        self.observed_local = []
         self.executed = []
         self.visual_activations = []
         self.query_submits = []
+        self.phase3_query_submits = []
         self.phase2_type_calls = []
         self.context_matches = True
         self.visual_click_result = None
@@ -113,17 +120,83 @@ class FakeComputer:
         self.on_visual_click = None
         self.postcondition_groundings = []
         self.postcondition_visual_result = None
+        self.on_postcondition_visual = None
+        self.preclick_local_observations = []
+        self.preclick_directed_observations = []
+        self.preclick_local_calls = []
+        self.preclick_directed_calls = []
+        self._preclick_original = None
+        self.field_value_reads = []
+        self.field_value_result = VisualFieldValueRead(
+            crop_valid=True, context_stable=True, credential_safe=True,
+            provider_attempts=(VisualProviderAttempt(
+                "fixture", "", 0, "value_read_empty",
+            ),),
+        )
+
+    @staticmethod
+    def _copy_for_preclick(source: Observation, suffix: str, *, directed: bool) -> Observation:
+        snapshot_id = f"{source.observation_id}-{suffix}"
+        screenshot = source.screenshot
+        if screenshot is not None:
+            screenshot = replace(screenshot, snapshot_id=snapshot_id)
+        if directed:
+            return replace(
+                source, observation_id=snapshot_id, screenshot=screenshot,
+                visual_provider=source.visual_provider or "fixture",
+                visual_directed_grounding=True,
+                visual_requested_max_elements=5,
+                visual_grounding_status=(
+                    VisualGroundingStatus.SUCCESS_WITH_CANDIDATES
+                    if source.visual_elements else VisualGroundingStatus.SUCCESS_EMPTY
+                ),
+                visual_provider_error=None,
+                visual_provider_attempts=(),
+                visual_provider_call_count=1,
+            )
+        return replace(
+            source, observation_id=snapshot_id, visual_elements=(), screenshot=None,
+            visual_provider=None, visual_model=None, visual_latency_ms=None,
+            visual_provider_error=None, visual_provider_attempts=(),
+            visual_directed_grounding=False, visual_requested_max_elements=None,
+            visual_grounding_status=None, visual_provider_call_count=0,
+        )
+
+    def observe_preclick_local(self, expected_context: Observation) -> Observation:
+        self.preclick_local_calls.append(expected_context)
+        self._preclick_original = expected_context
+        if self.preclick_local_observations:
+            return self.preclick_local_observations.pop(0)
+        return self._copy_for_preclick(expected_context, "preclick-uia", directed=False)
+
+    def observe_preclick_directed(self, grounding, expected_context: Observation) -> Observation:
+        self.preclick_directed_calls.append((grounding, expected_context))
+        if self.preclick_directed_observations:
+            return self.preclick_directed_observations.pop(0)
+        original = self._preclick_original or expected_context
+        copied = self._copy_for_preclick(original, "preclick-visual", directed=True)
+        return replace(
+            copied,
+            visual_requested_max_elements=grounding.max_elements,
+            visual_provider_attempts=original.visual_provider_attempts,
+        )
 
     def observe_local(self) -> Observation:
         if not self.locals:
             raise RuntimeError("no synthetic observation remains")
-        return self.locals.pop(0)
+        result = self.locals.pop(0)
+        self.observed_local.append(result)
+        return result
 
     def observe_directed(self, grounding) -> Observation:
         self.directed_calls.append(grounding)
         if not self.directed:
             raise RuntimeError("no synthetic visual observation remains")
         return self.directed.pop(0)
+
+    def read_visual_field_value(self, observation, field_id) -> VisualFieldValueRead:
+        self.field_value_reads.append((observation, field_id))
+        return self.field_value_result
 
     def execute(self, action, observation=None) -> ActionResult:
         self.executed.append((action, observation))
@@ -148,6 +221,8 @@ class FakeComputer:
 
     def verify_activation_postcondition_visual(self, observation, grounding) -> Observation:
         self.postcondition_groundings.append(grounding)
+        if self.on_postcondition_visual is not None:
+            self.on_postcondition_visual()
         if isinstance(self.postcondition_visual_result, Exception):
             raise self.postcondition_visual_result
         if self.postcondition_visual_result is not None:
@@ -169,6 +244,13 @@ class FakeComputer:
     def execute_generic_query_submit(self, action, observation) -> ActionResult:
         self.query_submits.append((action, observation))
         return ActionResult(True, action, "synthetic query submit", input_issued=True)
+
+    def execute_query_submit_phase3(
+        self, action, observation, verified_search_observation,
+    ) -> ActionResult:
+        self.phase3_query_submits.append((action, observation, verified_search_observation))
+        self.query_submits.append((action, observation))
+        return ActionResult(True, action, "synthetic visually verified query submit", input_issued=True)
 
 
 class FakeDecisionMaker:
@@ -1181,6 +1263,772 @@ def test_search_submit_still_requires_reobserved_literal_and_same_foreground(
     assert not computer.query_submits
 
 
+def _run_californication_search(locals_: list[Observation], *,
+                                directed: list[Observation] | None = None,
+                                visual_provider: object | None = None,
+                                field_value_result: VisualFieldValueRead | None = None,
+                                agent_type: type[GenericTaskDebugAgent] = GenericTaskDebugAgent):
+    candidate = ApplicationCandidate(APP_ID, "Alpha", "test", launch_policy="allow")
+    computer = FakeComputer(
+        locals_, directed, visual_provider=visual_provider,
+    )
+    if field_value_result is not None:
+        computer.field_value_result = field_value_result
+    result = agent_type(
+        computer, FakeDecisionMaker(),
+        app_catalog=MemoryApplicationCatalog((candidate,)),
+    ).run("Open Alpha and search for Californication")
+    return result, computer
+
+
+def _agent_with_visual_binding_mutation(mutation: str) -> type[GenericTaskDebugAgent]:
+    class MutatedBindingAgent(GenericTaskDebugAgent):
+        def _verify_query_field_continuity_after_type(
+            self, *args: Any, **kwargs: Any,
+        ) -> Any:
+            binding = self._active_visual_query_field_binding
+            if mutation == "missing":
+                self._active_visual_query_field_binding = None
+            elif binding is not None and mutation == "ambiguous":
+                self._active_visual_query_field_binding = replace(binding, unique=False)
+            elif binding is not None and mutation == "candidate":
+                self._active_visual_query_field_binding = replace(
+                    binding, selected_candidate=None,
+                )
+            elif binding is not None and mutation == "snapshot":
+                self._active_visual_query_field_binding = replace(
+                    binding, original_snapshot_id="inconsistent-snapshot",
+                )
+            return super()._verify_query_field_continuity_after_type(*args, **kwargs)
+
+    return MutatedBindingAgent
+
+
+def _californication_results(snapshot: str) -> Observation:
+    return observation(snapshot, elements=(UIElement(
+        "c2", "Californication", "Button", rectangle=Rect(10, 60, 260, 100),
+        enabled=True, visible=True, is_password=False,
+    ),))
+
+
+def test_search_submit_accepts_same_trusted_uia_field_with_exact_literal() -> None:
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        observation("typed", elements=(query_field(
+            "typed", "Californication", focused=True,
+        ),)),
+        _californication_results("results"),
+    ])
+
+    assert result.success and result.stop_reason == "search_completed"
+    assert result.query_submits == 1 and len(computer.query_submits) == 1
+    assert result.query_submit_continuity is not None
+    continuity = result.query_submit_continuity
+    assert continuity.result == "verified" and continuity.source == "uia"
+    assert continuity.reason == "verified"
+    assert continuity.same_trusted_app and continuity.same_window
+    assert continuity.field_identity_match and continuity.literal_confirmed
+    assert continuity.field_focused_or_active is True
+    assert continuity.structural_observation_complete is True
+    assert not continuity.visual_fallback_eligible
+    assert not continuity.visual_verification_attempted
+    assert not result.target_resolution_diagnostics or all(
+        item.attempt_stage != "target-resolution-after-type"
+        for item in result.target_resolution_diagnostics
+    )
+    assert result.final_target_activations == 0 and not computer.visual_activations
+
+
+@pytest.mark.parametrize("changed", ["app", "window"])
+def test_search_submit_blocks_if_trusted_app_or_window_changes_after_typing(changed: str) -> None:
+    after_type = observation(
+        "typed",
+        elements=(query_field("typed", "Californication", focused=True),),
+        app_id="another-app" if changed == "app" else APP_ID,
+        foreground_hwnd=200 if changed == "window" else 100,
+    )
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        after_type,
+    ])
+
+    assert not result.success and result.stop_reason == "query_submit_not_eligible"
+    assert result.query_submits == 0 and not computer.query_submits
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.reason == "trusted_foreground_changed"
+
+
+def test_search_submit_blocks_when_original_field_is_lost_for_another_editable() -> None:
+    other_field = UIElement(
+        "c9", "Message", "Edit", automation_id="message_input",
+        rectangle=Rect(5, 5, 300, 40), enabled=True, visible=True,
+        focused=True, is_password=False, observed_text="Californication",
+    )
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        observation("typed", elements=(other_field,)),
+    ])
+
+    assert not result.success and result.stop_reason == "query_submit_not_eligible"
+    assert not computer.query_submits
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.reason == "focused_query_field_not_reestablished"
+
+
+def test_search_submit_does_not_accept_query_text_outside_original_field() -> None:
+    elsewhere = UIElement(
+        "c2", "Recent query", "Text", rectangle=Rect(10, 60, 260, 100),
+        enabled=True, visible=True, focused=False, observed_text="Californication",
+    )
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        observation("typed", elements=(elsewhere,)),
+    ])
+
+    assert not result.success and result.stop_reason == "query_submit_not_eligible"
+    assert not computer.query_submits
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.reason == "focused_query_field_not_reestablished"
+    assert not result.query_submit_continuity.literal_confirmed
+
+
+def test_search_submit_accepts_unique_visual_continuity_of_active_same_field() -> None:
+    original_field = VisualElement(
+        "v-search", "Search", "search field", Rect(20, 20, 350, 60), None, True,
+    )
+    pre_type_field = VisualElement(
+        "v-focused", "Search", "search field", Rect(20, 20, 350, 60), None, True,
+    )
+    post_type_field = VisualElement(
+        "v-query", "Californication", "search field", Rect(20, 20, 350, 60), None, True,
+        activity="active",
+        field_label="Search", field_value="Californication",
+        is_query_field=True, credential_risk=False,
+    )
+    local = [
+        observation("initial", app_id=APP_ID, foreground_hwnd=77),
+        observation("after-click", app_id=APP_ID, foreground_hwnd=77),
+        observation("after-type", app_id=APP_ID, foreground_hwnd=77),
+        _californication_results("results"),
+    ]
+    directed = [
+        observation("field-selected", visual=(original_field,),
+                    app_id=APP_ID, foreground_hwnd=77),
+        observation("field-focused", visual=(pre_type_field,),
+                    app_id=APP_ID, foreground_hwnd=77),
+        observation("query-continuity", visual=(post_type_field,),
+                    app_id=APP_ID, foreground_hwnd=77),
+    ]
+    result, computer = _run_californication_search(
+        local, directed=directed, visual_provider=object(),
+    )
+
+    assert result.success and result.stop_reason == "search_completed"
+    assert result.query_submits == 1 and len(computer.query_submits) == 1
+    assert len(computer.phase3_query_submits) == 1
+    assert computer.phase3_query_submits[0][1] is computer.phase3_query_submits[0][2]
+    assert [action for action, _ in computer.executed if isinstance(action, TypeAction)] == [
+        TypeAction("Californication"),
+    ]
+    assert len(computer.directed_calls) == 3
+    assert computer.directed_calls[-1].verification_only is True
+    assert "Californication" in computer.directed_calls[-1].objective
+    assert result.visual_grounding_calls == 3
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.result == "verified"
+    assert result.query_submit_continuity.source == "visual"
+    assert result.query_submit_continuity.literal_confirmed
+    assert result.query_submit_continuity.field_focused_or_active is True
+    assert result.query_submit_continuity.visual_verification_attempted
+
+
+def _incomplete_visual_search(*, fresh_label: str = "¿Qué quieres reproducir?",
+                              fresh_value: str | None = "Californication",
+                              fresh_rect: Rect = Rect(20, 20, 350, 60),
+                              fresh_activity: str | None = "active",
+                              after_type_app: str = APP_ID,
+                              after_type_hwnd: int = 77,
+                              extra_fresh: tuple[VisualElement, ...] = (),
+                              fresh_credential_risk: bool | None = False,
+                              credential_risk: bool = False,
+                              provider_failure: bool = False,
+                              field_value_result: VisualFieldValueRead | None = None,
+                              focused_role: str = "search field",
+                              selected_fields: tuple[VisualElement, ...] | None = None,
+                              agent_type: type[GenericTaskDebugAgent] = GenericTaskDebugAgent):
+    selected_field = VisualElement(
+        "v-search", "Search", "search field", Rect(20, 20, 350, 60), None, True,
+    )
+    focused_field = replace(selected_field, id="v-focused", role=focused_role)
+    fresh_field = VisualElement(
+        "v-query", fresh_label, "search field", fresh_rect, None, True,
+        activity=fresh_activity,
+        field_label=fresh_label, field_value=fresh_value,
+        is_query_field=True, credential_risk=fresh_credential_risk,
+    )
+    after_elements: tuple[UIElement, ...] = ()
+    if credential_risk:
+        after_elements = (replace(
+            query_field("after-type", "Californication", focused=True),
+            is_password=True,
+        ),)
+    after_type = replace(
+        observation(
+            "after-type", elements=after_elements, app_id=after_type_app,
+            foreground_hwnd=after_type_hwnd,
+        ),
+        inspection_errors=1,
+    )
+    fresh = observation(
+        "query-continuity", visual=(fresh_field, *extra_fresh), app_id=APP_ID,
+        foreground_hwnd=77,
+    )
+    if provider_failure:
+        fresh = replace(
+            fresh,
+            visual_provider_error=ProviderErrorDiagnostic("timeout"),
+            visual_grounding_status=VisualGroundingStatus.PROVIDER_ERROR,
+        )
+    local = [
+        observation("initial", app_id=APP_ID, foreground_hwnd=77),
+        observation("after-click", app_id=APP_ID, foreground_hwnd=77),
+        after_type,
+        _californication_results("results"),
+    ]
+    directed = [
+        observation("field-selected", visual=selected_fields or (selected_field,),
+                    app_id=APP_ID, foreground_hwnd=77),
+        observation("field-focused", visual=(focused_field,),
+                    app_id=APP_ID, foreground_hwnd=77),
+        fresh,
+    ]
+    return _run_californication_search(
+        local, directed=directed, visual_provider=object(),
+        field_value_result=field_value_result, agent_type=agent_type,
+    )
+
+
+def test_visual_binding_survives_post_click_candidate_role_filtering() -> None:
+    result, computer = _incomplete_visual_search(focused_role="editable field")
+
+    assert result.success and result.query_submits == 1
+    # The fresh structural post-type observation has no visual candidates.
+    assert computer.observed_local[2].visual_elements == ()
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.original_binding_present is True
+    assert continuity.original_candidate_id == "v-search"
+    assert continuity.original_snapshot_id == "field-selected"
+    assert continuity.original_binding_unique is True
+    assert continuity.original_binding_source == "strong_visual_unique_spatial_correspondence"
+    assert continuity.original_geometry_available is True
+    assert continuity.fresh_candidate_count == 1
+    assert continuity.continuity_comparison_started is True
+
+
+def test_missing_original_visual_binding_blocks_without_reconstructing_it() -> None:
+    result, computer = _incomplete_visual_search(
+        agent_type=_agent_with_visual_binding_mutation("missing"),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "original_visual_query_field_binding_missing"
+    assert continuity.original_binding_present is False
+    assert continuity.original_candidate_id == "v-search"
+    assert continuity.original_snapshot_id == "field-selected"
+    assert continuity.continuity_comparison_started is False
+    assert continuity.failure_stage == "original_binding"
+    assert len(computer.directed_calls) == 2
+
+
+def test_missing_selected_candidate_from_stored_visual_provenance_blocks() -> None:
+    result, computer = _incomplete_visual_search(
+        agent_type=_agent_with_visual_binding_mutation("candidate"),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "original_visual_query_field_binding_inconsistent"
+    assert continuity.original_binding_present is True
+    assert continuity.original_binding_unique is False
+    assert continuity.original_candidate_id == "v-search"
+    assert continuity.original_geometry_available is False
+    assert continuity.failure_stage == "original_binding"
+    assert not continuity.continuity_comparison_started
+    assert len(computer.directed_calls) == 2
+
+
+def test_ambiguous_original_visual_binding_fails_closed() -> None:
+    result, computer = _incomplete_visual_search(
+        agent_type=_agent_with_visual_binding_mutation("ambiguous"),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "original_visual_query_field_not_unique"
+    assert continuity.original_binding_present is True
+    assert continuity.original_binding_unique is False
+    assert continuity.failure_stage == "original_binding"
+    assert not continuity.continuity_comparison_started
+    assert len(computer.directed_calls) == 2
+
+
+def test_inconsistent_original_visual_snapshot_binding_fails_closed() -> None:
+    result, computer = _incomplete_visual_search(
+        agent_type=_agent_with_visual_binding_mutation("snapshot"),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "original_visual_query_field_binding_inconsistent"
+    assert continuity.original_binding_present is True
+    assert continuity.original_candidate_id == "v-search"
+    assert continuity.original_snapshot_id == "inconsistent-snapshot"
+    assert continuity.failure_stage == "original_binding"
+    assert not continuity.continuity_comparison_started
+    assert len(computer.directed_calls) == 2
+
+
+def test_visual_binding_can_reach_value_read_when_fresh_value_is_missing() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None, focused_role="editable field",
+        field_value_result=VisualFieldValueRead(
+            "Californication", crop_valid=True, context_stable=True,
+            credential_safe=True,
+        ),
+    )
+
+    assert result.success and result.query_submits == 1
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.original_binding_present and continuity.original_binding_unique
+    assert continuity.continuity_comparison_started
+    assert continuity.value_read_fallback_eligible
+    assert continuity.value_read_fallback_attempted
+    assert continuity.literal_relation == "exact"
+
+
+def test_ambiguous_visual_query_discovery_never_creates_original_binding() -> None:
+    first = VisualElement("v-search-a", "Search", "search field", Rect(20, 20, 350, 60), None, True)
+    second = VisualElement("v-search-b", "Search in page", "search field", Rect(20, 80, 350, 120), None, True)
+    result, computer = _incomplete_visual_search(selected_fields=(first, second))
+
+    assert not result.success and result.query_submits == 0
+    assert not computer.visual_activations
+    diagnostics = result.query_field_diagnostics
+    assert diagnostics is not None
+    assert diagnostics.selection_reason == "multiple_visual_query_fields"
+    assert diagnostics.selected_candidate_id is None
+    assert result.query_submit_continuity is None
+
+
+def test_incomplete_post_type_uia_uses_one_fresh_visual_continuity_check() -> None:
+    result, computer = _incomplete_visual_search()
+
+    assert result.success and result.query_submits == 1
+    assert len(computer.directed_calls) == 3
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.result == "verified"
+    assert continuity.structural_observation_complete is False
+    assert continuity.incompleteness_reasons == ("inspection_errors",)
+    assert continuity.visual_fallback_eligible
+    assert continuity.visual_verification_attempted
+    assert continuity.visual_candidate_count == 1
+    assert continuity.literal_relation == "exact"
+    assert continuity.field_continuity_relation == "same"
+    assert continuity.active_focused_relation == "active"
+    assert continuity.credential_safe is True
+    assert continuity.final_continuity_result == "verified"
+
+
+def test_incomplete_post_type_visual_continuity_uses_field_value_not_placeholder() -> None:
+    result, computer = _incomplete_visual_search()
+
+    assert result.success and result.query_submits == 1
+    assert len(computer.directed_calls) == 3
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.result == "verified"
+    assert continuity.literal_relation == "exact"
+    assert continuity.visual_verification_attempted
+    assert continuity.query_field_candidate_count == 1
+    assert continuity.visual_candidates[0].field_label == "¿Qué quieres reproducir?"
+    assert continuity.visual_candidates[0].field_value == "Californication"
+    assert continuity.visual_candidates[0].literal_relation == "exact"
+    assert computer.field_value_reads == []
+    assert continuity.value_read_fallback_eligible is False
+    assert continuity.value_read_fallback_attempted is False
+    assert continuity.final_submit_release is True
+
+
+def test_incomplete_post_type_visual_continuity_blocks_wrong_field_value() -> None:
+    result, computer = _incomplete_visual_search(fresh_value="Californicatio")
+
+    assert not result.success and result.query_submits == 0
+    assert len(computer.directed_calls) == 3
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "typed_literal_not_confirmed_visually"
+    assert continuity.literal_relation == "mismatch"
+    assert continuity.visual_candidates[0].candidate_acceptance == "blocked_literal_value_mismatch"
+
+
+def test_incomplete_post_type_visual_continuity_blocks_missing_field_value() -> None:
+    result, computer = _incomplete_visual_search(fresh_value=None)
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "typed_literal_not_confirmed_visually"
+    assert continuity.literal_relation == "missing"
+    assert continuity.visual_candidates[0].field_value is None
+    assert continuity.visual_candidates[0].candidate_acceptance == "blocked_literal_value_missing"
+    assert len(computer.directed_calls) == 3
+    assert continuity.value_read_fallback_eligible is True
+    assert continuity.value_read_fallback_attempted is True
+    assert continuity.crop_valid is True
+    assert continuity.extracted_field_value is None
+    assert continuity.final_submit_release is False
+    assert len(computer.field_value_reads) == 1
+
+
+def test_missing_field_value_uses_one_bounded_read_and_exact_match_releases_submit() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None, field_value_result=VisualFieldValueRead(
+        "Californication", crop_valid=True, context_stable=True, credential_safe=True,
+        provider_attempts=(VisualProviderAttempt("fixture", "crop-reader", 12, "success"),),
+        ),
+    )
+
+    assert result.success and result.query_submits == 1
+    assert len(computer.field_value_reads) == 1
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.value_read_fallback_eligible
+    assert continuity.value_read_fallback_attempted
+    assert continuity.crop_valid is True
+    assert continuity.extracted_field_value == "Californication"
+    assert continuity.literal_relation == "exact"
+    assert continuity.value_read_provider_attempts[0].result_class == "success"
+    assert continuity.final_submit_release is True
+
+
+def test_cropped_field_value_mismatch_blocks_submit() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None,
+        field_value_result=VisualFieldValueRead(
+            "Californicatio", crop_valid=True, context_stable=True, credential_safe=True,
+        ),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.extracted_field_value == "Californicatio"
+    assert continuity.literal_relation == "mismatch"
+    assert continuity.crop_valid is True
+    assert continuity.final_submit_release is False
+    assert len(computer.field_value_reads) == 1
+
+
+def test_cropped_field_value_missing_blocks_submit() -> None:
+    result, computer = _incomplete_visual_search(fresh_value=None)
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.literal_relation == "missing"
+    assert continuity.crop_valid is True
+    assert continuity.final_submit_release is False
+    assert len(computer.field_value_reads) == 1
+
+
+def test_cropped_value_provider_failure_blocks_submit() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None,
+        field_value_result=VisualFieldValueRead(
+            "Californication", crop_valid=True, context_stable=True, credential_safe=True,
+            error=ProviderErrorDiagnostic("timeout"),
+            provider_attempts=(VisualProviderAttempt(
+                "fixture", "crop-reader", 20_000, "provider_failure", "timeout",
+            ),),
+        ),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "visual_value_read_provider_failure"
+    assert continuity.literal_relation == "unavailable"
+    assert continuity.value_read_provider_attempts[0].result_class == "provider_failure"
+    assert not continuity.final_submit_release
+    assert len(computer.field_value_reads) == 1
+
+
+def test_context_change_before_crop_blocks_submit() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None,
+        field_value_result=VisualFieldValueRead(
+            "Californication", crop_valid=True, context_stable=False, credential_safe=True,
+            reason="window_geometry_changed",
+        ),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "visual_value_read_context_changed"
+    assert continuity.literal_relation == "unavailable"
+    assert not continuity.final_submit_release
+    assert len(computer.field_value_reads) == 1
+
+
+def test_credential_risk_appearing_before_crop_blocks_submit() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None,
+        field_value_result=VisualFieldValueRead(
+            "Californication", crop_valid=True, context_stable=True, credential_safe=False,
+        ),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "visual_value_read_credential_risk"
+    assert continuity.credential_safe is False
+    assert not continuity.final_submit_release
+    assert len(computer.field_value_reads) == 1
+
+
+def test_unbounded_field_geometry_blocks_value_read_before_attempt() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value=None,
+        field_value_result=VisualFieldValueRead(
+            "Californication", crop_valid=False, context_stable=True,
+            credential_safe=True, reason="crop_invalid",
+        ),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "visual_value_read_crop_invalid"
+    assert continuity.value_read_fallback_eligible
+    assert continuity.value_read_fallback_attempted
+    assert continuity.crop_valid is False
+    assert len(computer.field_value_reads) == 1
+
+
+def test_query_literal_in_nearby_result_is_not_field_value_evidence() -> None:
+    nearby_result = VisualElement(
+        "v-result", "Californication", "list item", Rect(20, 100, 300, 150), None, True,
+        is_query_field=False, credential_risk=False,
+    )
+    result, _computer = _incomplete_visual_search(
+        fresh_value=None, extra_fresh=(nearby_result,),
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.query_field_candidate_count == 1
+    assert continuity.visual_candidates[0].field_value is None
+    assert continuity.visual_candidates[1].is_query_field is False
+    assert continuity.visual_candidates[1].field_value is None
+    assert continuity.reason == "typed_literal_not_confirmed_visually"
+
+
+def test_query_literal_in_field_label_without_field_value_is_not_confirmation() -> None:
+    result, _computer = _incomplete_visual_search(
+        fresh_label="Californication", fresh_value=None,
+    )
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.visual_candidates[0].field_label == "Californication"
+    assert continuity.visual_candidates[0].field_value is None
+    assert continuity.literal_relation == "missing"
+
+
+def test_visual_query_continuity_normalizes_value_only_for_comparison() -> None:
+    result, computer = _incomplete_visual_search(
+        fresh_value="  CALIFORNICATION  ",
+    )
+
+    assert result.success and result.query_submits == 1
+    typed_actions = [action for action, _ in computer.executed if isinstance(action, TypeAction)]
+    assert typed_actions == [TypeAction("Californication")]
+    continuity = result.query_submit_continuity
+    assert continuity is not None and continuity.literal_relation == "exact"
+
+
+def test_visual_query_continuity_blocks_credential_risk_even_when_value_matches() -> None:
+    result, computer = _incomplete_visual_search(fresh_credential_risk=True)
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "credential_sensitive_context"
+    assert continuity.credential_safe is False
+    assert continuity.visual_candidates[0].field_value == "Californication"
+    assert continuity.visual_candidates[0].candidate_acceptance == "blocked_credential_risk"
+    assert len(computer.directed_calls) == 3
+
+
+def test_visual_query_continuity_blocks_multiple_fields_even_with_same_value() -> None:
+    second_field = VisualElement(
+        "v-second", "Secondary search", "search field", Rect(420, 20, 750, 60), None, True,
+        activity="active", field_label="Secondary search",
+        field_value="Californication", is_query_field=True, credential_risk=False,
+    )
+    result, computer = _incomplete_visual_search(extra_fresh=(second_field,))
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "multiple_visual_query_fields"
+    assert continuity.query_field_candidate_count == 2
+    assert all(item.candidate_acceptance == "blocked_ambiguous"
+               for item in continuity.visual_candidates if item.is_query_field)
+    assert len(computer.directed_calls) == 3
+
+
+def test_query_submit_visual_candidate_diagnostics_are_bounded_redacted_and_coordinate_free() -> None:
+    token = "sk-test-placeholder-for-redaction"
+    extra = VisualElement(
+        "v-status", "Californication " + token + (" x" * 100), "text",
+        Rect(360, 20, 500, 60), None, False,
+    )
+    result, _computer = _incomplete_visual_search(
+        fresh_value=token + (" x" * 100), extra_fresh=(extra,),
+    )
+
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.visual_candidate_count == 2
+    assert continuity.query_field_candidate_count == 1
+    assert [item.is_query_field for item in continuity.visual_candidates] == [True, False]
+    assert continuity.visual_candidates[0].literal_relation == "mismatch"
+    summary = continuity.visual_candidates[0]
+    assert token not in (summary.field_value or "")
+    assert "[REDACTED]" in (summary.field_value or "")
+    assert len(summary.field_value or "") <= 100
+    assert continuity.visual_candidates[1].field_value is None
+    assert continuity.visual_candidates[1].literal_relation == "not_applicable"
+    serialized = str(asdict(continuity))
+    assert all(key not in serialized for key in ("left", "top", "right", "bottom"))
+
+
+def test_incomplete_post_type_visual_continuity_blocks_inactive_field() -> None:
+    result, computer = _incomplete_visual_search(fresh_activity="not_active")
+
+    assert not result.success and result.query_submits == 0
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "visual_query_field_not_active"
+    assert continuity.active_focused_relation == "inactive"
+    assert continuity.visual_verification_attempted
+
+
+@pytest.mark.parametrize(("changed", "kwargs"), [
+    ("app", {"after_type_app": "different-app"}),
+    ("window", {"after_type_hwnd": 88}),
+])
+def test_incomplete_post_type_visual_continuity_blocks_changed_trusted_context(
+    changed: str, kwargs: dict[str, object],
+) -> None:
+    result, computer = _incomplete_visual_search(**kwargs)
+
+    assert not result.success and result.query_submits == 0
+    assert len(computer.directed_calls) == 2
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "trusted_foreground_changed"
+    assert not continuity.visual_verification_attempted
+    assert not continuity.visual_fallback_eligible
+    assert continuity.failure_stage == "trusted_context"
+    assert not continuity.continuity_comparison_started
+
+
+def test_incomplete_post_type_visual_continuity_blocks_credential_risk() -> None:
+    result, computer = _incomplete_visual_search(credential_risk=True)
+
+    assert not result.success and result.query_submits == 0
+    assert len(computer.directed_calls) == 2
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "credential_sensitive_context"
+    assert continuity.credential_safe is False
+    assert not continuity.visual_verification_attempted
+
+
+def test_incomplete_post_type_visual_provider_failure_blocks_enter() -> None:
+    result, computer = _incomplete_visual_search(provider_failure=True)
+
+    assert not result.success and result.query_submits == 0
+    assert len(computer.directed_calls) == 3
+    continuity = result.query_submit_continuity
+    assert continuity is not None
+    assert continuity.reason == "visual_observation_incomplete_or_context_changed"
+    assert continuity.visual_verification_attempted
+    assert continuity.visual_candidate_count == 1
+    assert continuity.literal_relation == "unavailable"
+    assert continuity.final_continuity_result == "blocked"
+
+
+def test_search_submit_blocks_password_field() -> None:
+    password = replace(
+        query_field("typed", "Californication", focused=True), is_password=True,
+    )
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        observation("typed", elements=(password,)),
+    ])
+
+    assert not result.success and result.stop_reason == "query_submit_not_eligible"
+    assert not computer.query_submits
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.reason == "credential_sensitive_context"
+
+
+def test_search_submit_blocks_multiple_query_fields() -> None:
+    second = replace(
+        query_field("typed-second", "Californication", focused=False),
+        id="c2", automation_id="secondary_search_query",
+    )
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        observation("typed", elements=(
+            query_field("typed", "Californication", focused=True), second,
+        )),
+    ])
+
+    assert not result.success and result.stop_reason == "query_submit_not_eligible"
+    assert not computer.query_submits
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.reason == "multiple_query_fields_after_typing"
+
+
+def test_search_submit_blocks_literal_mismatch_in_original_field() -> None:
+    result, computer = _run_californication_search([
+        observation("before", elements=(query_field("before", focused=True),)),
+        observation("typed", elements=(query_field("typed", "Californiacation", focused=True),)),
+    ])
+
+    assert not result.success and result.stop_reason == "query_submit_not_eligible"
+    assert not computer.query_submits
+    assert result.query_submit_continuity is not None
+    assert result.query_submit_continuity.reason == "typed_literal_not_confirmed_in_query_field"
+    assert not result.query_submit_continuity.literal_confirmed
+
+
 def test_visible_uia_chat_launches_if_needed_without_grounding_type_or_enter() -> None:
     computer = FakeComputer([
         observation("before", app_id=""),
@@ -1225,6 +2073,9 @@ def test_generic_activation_timeout_reports_diagnostics_before_any_target_work()
         observation("intermediate-2", app_id="", process_id=50, foreground_hwnd=500),
         observation("intermediate-3", app_id="", process_id=50, foreground_hwnd=500),
     ], visual_provider=object())
+    computer.activation_target_probe = (
+        lambda _candidate: lambda: TrustedApplicationRuntimeState()
+    )
     decision = FakeDecisionMaker("c1")
     catalog = chat_catalog()
     agent = GenericTaskDebugAgent(
@@ -1249,6 +2100,10 @@ def test_generic_activation_timeout_reports_diagnostics_before_any_target_work()
     assert diagnostic.activation_attempts == 3
     assert diagnostic.identity_match is False
     assert diagnostic.identity_match_method == "none"
+    assert result.activation_lifecycle is not None
+    assert result.activation_lifecycle.timing is not None
+    assert result.activation_lifecycle.timing.open_app_action_elapsed_ms == 0
+    assert result.activation_lifecycle.timing.activation_wait_started_since_launch_ms == 0
     assert diagnostic.initial_foreground.trusted_app_id == "old-app"
     assert diagnostic.final_foreground.trusted_app_id is None
     assert diagnostic.observed_foregrounds[-1].trusted_app_id is None
@@ -1391,7 +2246,7 @@ def test_visible_visual_chat_uses_same_resolver_and_snapshot_bound_click() -> No
     assert len(computer.directed_calls) == 1
     assert len(decision.calls) == 1
     action, bound_observation = computer.visual_activations[0]
-    assert action == VisualClickAction("visual", "v1")
+    assert action == VisualClickAction("visual-preclick-visual", "v1")
     assert bound_observation.observation_id == action.snapshot_id
     assert not computer.query_submits
 
@@ -2077,7 +2932,7 @@ def test_fresh_directed_visual_evidence_skips_jev_but_uses_normal_activation_pat
     assert result.final_target_activations == 1
     assert result.visual_target_activations == 1
     assert result.post_action_observation_obtained
-    assert computer.visual_activations[0][0] == VisualClickAction("grounded", "v1")
+    assert computer.visual_activations[0][0] == VisualClickAction("grounded-preclick-visual", "v1")
 
 
 def test_deterministic_selection_keeps_budget_and_executor_failure_gates() -> None:
@@ -2183,6 +3038,186 @@ def _activation_fixture(after: Observation, *, visual_provider: object | None = 
     return result, computer
 
 
+def _visual_postcondition_observation(
+    snapshot: str, elements: tuple[VisualElement, ...],
+) -> Observation:
+    base = observation(snapshot)
+    metadata = ScreenshotMetadata(
+        snapshot, 100, Rect(0, 0, 800, 600), Rect(0, 0, 800, 600),
+        800, 600, 96, 96, 1.0, 1.0,
+    )
+    return replace(
+        base, screenshot=metadata, visual_elements=elements,
+        visual_grounding_status=(
+            VisualGroundingStatus.SUCCESS_WITH_CANDIDATES if elements
+            else VisualGroundingStatus.SUCCESS_EMPTY
+        ),
+        visual_directed_grounding=True,
+    )
+
+
+def _visual_postcondition_candidate(
+    candidate_id: str,
+    label: str,
+    role: str,
+    rectangle: Rect,
+    *,
+    region: VisualRegion,
+    activity: str = "unknown",
+    selection_state: VisualSelectionState = VisualSelectionState.UNKNOWN,
+) -> VisualElement:
+    return VisualElement(
+        candidate_id, label, role, rectangle, None, False,
+        activity=activity, selection_state=selection_state, region=region,
+    )
+
+
+def _evaluate_iago_visual_postcondition(
+    candidates: tuple[VisualElement, ...], *, provider_incomplete: bool = False,
+):
+    target = TargetSpec("Iago", (), "conversation", "activate")
+    visual = _visual_postcondition_observation("visual-postcondition", candidates)
+    if provider_incomplete:
+        visual = replace(
+            visual, visual_grounding_status=VisualGroundingStatus.PROVIDER_ERROR,
+            visual_provider_error=ProviderErrorDiagnostic("timeout"),
+        )
+    return evaluate_target_activation_postcondition(
+        target, visual, trusted_context_stable=True,
+        visual_verification_called=True,
+        visual_grounding_objective=(
+            'Determine whether "Iago" is active/open/selected, not merely visible.'
+        ),
+        provider_incomplete=provider_incomplete,
+    )
+
+
+def test_visual_postcondition_sidebar_identity_alone_is_insufficient() -> None:
+    result = _evaluate_iago_visual_postcondition((
+        _visual_postcondition_candidate(
+            "v1", "Iago", "list item", Rect(20, 120, 200, 165),
+            region=VisualRegion.NAVIGATION, activity="not_active",
+        ),
+    ))
+
+    assert result.result is ActivationPostconditionResult.INSUFFICIENT
+    assert result.target_identity_evidence is ActivationEvidence.MATCH
+    assert result.active_state_evidence is ActivationEvidence.UNKNOWN
+    assert result.visual_candidate_count == 1
+    candidate = result.visual_candidate_diagnostics[0]
+    assert candidate.identity_text == "Iago"
+    assert candidate.presentation_role == "list_item"
+    assert candidate.region == "navigation"
+    assert candidate.geometry_region_bucket == "navigation"
+    assert candidate.activity_evidence == "not_active"
+    assert candidate.active_state_relation is ActivationEvidence.UNKNOWN
+    assert candidate.authority_class == "non_authoritative"
+    assert candidate.rejection_reason == "navigation_identity_is_not_active_context_evidence"
+
+
+def test_visual_postcondition_identity_in_active_header_verifies() -> None:
+    result = _evaluate_iago_visual_postcondition((
+        _visual_postcondition_candidate(
+            "v1", "Iago", "text", Rect(420, 55, 700, 120),
+            region=VisualRegion.HEADER,
+        ),
+    ))
+
+    assert result.result is ActivationPostconditionResult.VERIFIED
+    assert result.target_identity_evidence is ActivationEvidence.MATCH
+    assert result.active_state_evidence is ActivationEvidence.MATCH
+    assert result.visual_candidate_diagnostics[0].authority_class == "authoritative"
+
+
+def test_visual_postcondition_other_identity_in_active_detail_contradicts() -> None:
+    result = _evaluate_iago_visual_postcondition((
+        _visual_postcondition_candidate(
+            "v1", "Iago", "list item", Rect(20, 120, 200, 165),
+            region=VisualRegion.NAVIGATION, activity="not_active",
+        ),
+        _visual_postcondition_candidate(
+            "v2", "Marta", "text", Rect(420, 230, 700, 280),
+            region=VisualRegion.DETAIL, activity="active",
+        ),
+    ))
+
+    assert result.result is ActivationPostconditionResult.CONTRADICTED
+    assert result.active_state_evidence is ActivationEvidence.MISMATCH
+    detail = next(item for item in result.visual_candidate_diagnostics
+                  if item.candidate_id == "v2")
+    assert detail.region == "detail"
+    assert detail.identity_relation is ActivationEvidence.MISMATCH
+    assert detail.authority_class == "authoritative"
+
+
+def test_visual_postcondition_selected_row_and_matching_detail_verify() -> None:
+    result = _evaluate_iago_visual_postcondition((
+        _visual_postcondition_candidate(
+            "v1", "Iago", "list item", Rect(20, 120, 200, 165),
+            region=VisualRegion.NAVIGATION, activity="not_active",
+            selection_state=VisualSelectionState.SELECTED,
+        ),
+        _visual_postcondition_candidate(
+            "v2", "Iago", "text", Rect(420, 230, 700, 280),
+            region=VisualRegion.DETAIL, activity="active",
+        ),
+    ))
+
+    assert result.result is ActivationPostconditionResult.VERIFIED
+    row = next(item for item in result.visual_candidate_diagnostics
+               if item.candidate_id == "v1")
+    assert row.selected_state == "selected"
+    assert row.authority_class == "authoritative"
+    assert row.active_state_relation is ActivationEvidence.MATCH
+
+
+def test_visual_postcondition_selected_row_conflicting_detail_contradicts() -> None:
+    result = _evaluate_iago_visual_postcondition((
+        _visual_postcondition_candidate(
+            "v1", "Iago", "list item", Rect(20, 120, 200, 165),
+            region=VisualRegion.NAVIGATION,
+            selection_state=VisualSelectionState.SELECTED,
+        ),
+        _visual_postcondition_candidate(
+            "v2", "Marta", "text", Rect(420, 230, 700, 280),
+            region=VisualRegion.DETAIL, activity="active",
+        ),
+    ))
+
+    assert result.result is ActivationPostconditionResult.CONTRADICTED
+    row = next(item for item in result.visual_candidate_diagnostics
+               if item.candidate_id == "v1")
+    assert row.authority_class == "authoritative"
+    assert row.active_state_relation is ActivationEvidence.MISMATCH
+    assert row.rejection_reason == "selected_row_conflicts_with_active_detail_identity"
+
+
+def test_visual_postcondition_identity_without_active_or_region_evidence_is_insufficient() -> None:
+    result = _evaluate_iago_visual_postcondition((
+        _visual_postcondition_candidate(
+            "v1", "Iago", "text", Rect(420, 380, 700, 440),
+            region=VisualRegion.CONTENT,
+        ),
+    ))
+
+    assert result.result is ActivationPostconditionResult.INSUFFICIENT
+    assert result.target_identity_evidence is ActivationEvidence.MATCH
+    assert result.active_state_evidence is ActivationEvidence.UNKNOWN
+    candidate = result.visual_candidate_diagnostics[0]
+    assert candidate.region == "content"
+    assert candidate.authority_class == "non_authoritative"
+    assert candidate.rejection_reason == "content_identity_requires_selected_row_or_detail_context"
+
+
+def test_visual_postcondition_provider_failure_is_incomplete() -> None:
+    result = _evaluate_iago_visual_postcondition((), provider_incomplete=True)
+
+    assert result.result is ActivationPostconditionResult.INCOMPLETE
+    assert result.visual_candidate_count == 0
+    assert result.visual_candidate_diagnostics == ()
+    assert result.failure_reason == "visual_verification_incomplete"
+
+
 def test_semantic_postcondition_verifies_selected_requested_identity() -> None:
     result, computer = _activation_fixture(active_conversation("after", "Alpha"))
 
@@ -2194,6 +3229,122 @@ def test_semantic_postcondition_verifies_selected_requested_identity() -> None:
     assert not computer.postcondition_groundings
 
 
+def test_visible_sidebar_neighbor_does_not_override_authoritative_active_target() -> None:
+    after = observation("after", elements=(
+        replace(conversation("c1", "Alpha"), selected=True),
+        conversation("c2", "Beta"),
+    ))
+
+    result, computer = _activation_fixture(after)
+
+    assert result.success and result.stop_reason == "target_activated"
+    postcondition = result.target_activation_postcondition
+    assert postcondition is not None
+    assert postcondition.result is ActivationPostconditionResult.VERIFIED
+    assert postcondition.target_identity_evidence is ActivationEvidence.MATCH
+    assert postcondition.active_state_evidence is ActivationEvidence.MATCH
+    diagnostic = postcondition.structural_postcondition_evidence
+    assert diagnostic.ignored_non_authoritative_count >= 1
+    beta = next(item for item in diagnostic.evidence_items if item.identity_text == "Beta")
+    assert beta.presentation_role == "navigation_sidebar"
+    assert beta.identity_relation is ActivationEvidence.MISMATCH
+    assert beta.active_state_relation is ActivationEvidence.UNKNOWN
+    assert beta.authority_class == "non_authoritative_visible"
+    assert not computer.postcondition_groundings
+
+
+def test_sidebar_mismatch_without_active_identity_is_insufficient_and_allows_visual() -> None:
+    after = observation("after", elements=(conversation("c1", "Beta"),))
+    computer = _activation_computer(after, visual_provider=object())
+    computer.postcondition_visual_result = replace(
+        after, visual_grounding_status=VisualGroundingStatus.SUCCESS_EMPTY,
+        visual_directed_grounding=True,
+    )
+
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker("c1")).run("Select Alpha")
+
+    assert not result.success and result.stop_reason == "target_activation_unverified"
+    postcondition = result.target_activation_postcondition
+    assert postcondition is not None
+    assert postcondition.result is ActivationPostconditionResult.INSUFFICIENT
+    assert postcondition.target_identity_evidence is ActivationEvidence.UNKNOWN
+    assert postcondition.active_state_evidence is ActivationEvidence.UNKNOWN
+    diagnostic = postcondition.structural_postcondition_evidence
+    assert diagnostic.contradictory_identity_count >= 1
+    assert diagnostic.authoritative_contradiction_count == 0
+    assert diagnostic.ignored_non_authoritative_count >= 1
+    assert len(computer.postcondition_groundings) == 1
+    assert computer.postcondition_groundings[0].verification_only is True
+
+
+def test_current_entity_window_title_can_contradict_requested_target() -> None:
+    after = replace(observation("after"), window_title="Chat with Beta")
+
+    diagnostic = evaluate_target_activation_postcondition(
+        requested_target_spec("Select Alpha"), after,
+        trusted_context_stable=True,
+    )
+
+    assert diagnostic.result is ActivationPostconditionResult.CONTRADICTED
+    assert diagnostic.target_identity_evidence is ActivationEvidence.MISMATCH
+    title = diagnostic.structural_postcondition_evidence.evidence_items[0]
+    assert title.evidence_kind == "window_title"
+    assert title.presentation_role == "current_surface_title"
+    assert title.authority_class == "authoritative_active_entity"
+    assert title.active_state_relation is ActivationEvidence.MISMATCH
+
+
+def test_conflicting_authoritative_uia_facts_are_insufficient_and_allow_visual() -> None:
+    after = observation("after", elements=(
+        replace(conversation("c1", "Alpha"), selected=True),
+        UIElement(
+            "c2", "Beta", "Text", visible=True,
+            parent_name="Conversation details", parent_control_type="Pane",
+        ),
+    ))
+    computer = _activation_computer(after, visual_provider=object())
+    computer.postcondition_visual_result = replace(
+        after, visual_grounding_status=VisualGroundingStatus.SUCCESS_EMPTY,
+        visual_directed_grounding=True,
+    )
+
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker("c1")).run("Select Alpha")
+
+    postcondition = result.target_activation_postcondition
+    assert postcondition is not None
+    assert postcondition.result is ActivationPostconditionResult.INSUFFICIENT
+    assert postcondition.active_state_evidence is ActivationEvidence.UNKNOWN
+    assert postcondition.structural_postcondition_evidence.conflicting_authoritative_evidence
+    assert len(computer.postcondition_groundings) == 1
+    assert len(computer.executed) == 1
+
+
+def test_unrelated_focused_control_is_not_authoritative_and_diagnostic_is_redacted() -> None:
+    after = observation("after", elements=(UIElement(
+        "c9", "Beta", "Edit", visible=True, focused=True,
+        parent_name="Unrelated form", parent_control_type="Pane",
+    ),))
+
+    diagnostic = evaluate_target_activation_postcondition(
+        requested_target_spec("Select Alpha"), after,
+        trusted_context_stable=True,
+        clean_text=lambda value: "[REDACTED]" if value == "Beta" else value,
+    )
+
+    assert diagnostic.result is ActivationPostconditionResult.INSUFFICIENT
+    item = next(
+        item for item in diagnostic.structural_postcondition_evidence.evidence_items
+        if item.control_id == "c9"
+    )
+    assert item.control_type == "Edit" and item.focused is True
+    assert item.presentation_role == "unrelated_control"
+    assert item.authority_class == "non_authoritative_visible"
+    assert item.identity_relation is ActivationEvidence.MISMATCH
+    assert item.active_state_relation is ActivationEvidence.UNKNOWN
+    assert item.identity_text == "[REDACTED]"
+    assert "hwnd" not in repr(asdict(diagnostic)).casefold()
+
+
 def test_wrong_neighbor_selected_after_successful_click_fails_without_retry() -> None:
     result, computer = _activation_fixture(active_conversation("after", "Beta"))
 
@@ -2202,6 +3353,11 @@ def test_wrong_neighbor_selected_after_successful_click_fails_without_retry() ->
     assert result.target_activation_postcondition is not None
     assert result.target_activation_postcondition.result is ActivationPostconditionResult.CONTRADICTED
     assert result.target_activation_postcondition.target_identity_evidence.value == "mismatch"
+    evidence = result.target_activation_postcondition.structural_postcondition_evidence
+    assert evidence.authoritative_contradiction_count >= 1
+    beta = next(item for item in evidence.evidence_items if item.identity_text == "Beta")
+    assert beta.selected is True
+    assert beta.authority_class == "authoritative_active_entity"
     assert len(computer.executed) == 1
     assert not computer.query_submits and not computer.postcondition_groundings
 
@@ -2227,24 +3383,20 @@ def test_visible_but_unselected_identity_does_not_verify_activation() -> None:
     assert not result.success and result.stop_reason == "target_activation_unverified"
     assert result.target_activation_postcondition is not None
     assert result.target_activation_postcondition.result is ActivationPostconditionResult.INSUFFICIENT
+    assert result.target_activation_postcondition.target_identity_evidence.value == "match"
+    assert result.target_activation_postcondition.active_state_evidence.value == "unknown"
     assert not computer.postcondition_groundings
     assert len(computer.executed) == 1
 
 
 def test_visual_postcondition_can_verify_active_identity_once() -> None:
     after = observation("after")
-    visual = replace(
-        after,
-        visual_elements=(VisualElement(
-            "v1", "Alpha", "list item", Rect(10, 20, 150, 70), None, False,
-            activity="active",
-        ),),
-        visual_grounding_status=VisualGroundingStatus.SUCCESS_WITH_CANDIDATES,
-        visual_directed_grounding=True,
-        visual_provider_attempts=(VisualProviderAttempt(
+    visual = replace(_visual_postcondition_observation("after", (VisualElement(
+        "v1", "Alpha", "text", Rect(420, 60, 700, 120), None, False,
+        activity="active", region=VisualRegion.HEADER,
+    ),)), visual_provider_attempts=(VisualProviderAttempt(
             "gemini", "gemini-3.5-flash-lite", 20, "success_with_candidates",
-        ),),
-    )
+        ),))
     computer = _activation_computer(after, visual_provider=object())
     computer.postcondition_visual_result = visual
 
@@ -2257,20 +3409,39 @@ def test_visual_postcondition_can_verify_active_identity_once() -> None:
     assert result.target_activation_postcondition is not None
     assert result.target_activation_postcondition.result is ActivationPostconditionResult.VERIFIED
     assert result.target_activation_postcondition.source.value == "visual"
+    assert "active, open, or selected entity, not merely visible" in (
+        result.target_activation_postcondition.visual_grounding_objective or ""
+    )
+    assert len(computer.executed) == 1
+
+
+def test_misleading_sidebar_identity_does_not_override_visual_active_target() -> None:
+    after = observation("after", elements=(conversation("c1", "Beta"),))
+    visual = replace(_visual_postcondition_observation("after", (VisualElement(
+        "v1", "Alpha", "text", Rect(420, 60, 700, 120), None, False,
+        activity="active", region=VisualRegion.HEADER,
+    ),)), visual_provider_attempts=(VisualProviderAttempt(
+            "gemini", "gemini-3.5-flash-lite", 20, "success_with_candidates",
+        ),))
+    computer = _activation_computer(after, visual_provider=object())
+    computer.postcondition_visual_result = visual
+
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker("c1")).run("Select Alpha")
+
+    assert result.success and result.stop_reason == "target_activated"
+    assert result.target_activation_postcondition is not None
+    assert result.target_activation_postcondition.result is ActivationPostconditionResult.VERIFIED
+    assert result.target_activation_postcondition.source.value == "visual"
+    assert len(computer.postcondition_groundings) == 1
     assert len(computer.executed) == 1
 
 
 def test_visual_postcondition_identifying_neighbor_fails_closed() -> None:
     after = observation("after")
-    visual = replace(
-        after,
-        visual_elements=(VisualElement(
-            "v1", "Beta", "list item", Rect(10, 20, 150, 70), None, False,
-            activity="active",
-        ),),
-        visual_grounding_status=VisualGroundingStatus.SUCCESS_WITH_CANDIDATES,
-        visual_directed_grounding=True,
-    )
+    visual = _visual_postcondition_observation("after", (VisualElement(
+        "v1", "Beta", "text", Rect(420, 60, 700, 120), None, False,
+        activity="active", region=VisualRegion.HEADER,
+    ),))
     computer = _activation_computer(after, visual_provider=object())
     computer.postcondition_visual_result = visual
 
@@ -2283,17 +3454,31 @@ def test_visual_postcondition_identifying_neighbor_fails_closed() -> None:
     assert len(computer.executed) == 1
 
 
+def test_trusted_context_is_rechecked_after_remote_visual_verification() -> None:
+    after = observation("after")
+    visual = _visual_postcondition_observation("after", (VisualElement(
+        "v1", "Alpha", "text", Rect(420, 60, 700, 120), None, False,
+        activity="active", region=VisualRegion.HEADER,
+    ),))
+    computer = _activation_computer(after, visual_provider=object())
+    computer.postcondition_visual_result = visual
+    computer.on_postcondition_visual = lambda: setattr(computer, "context_matches", False)
+
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker("c1")).run("Select Alpha")
+
+    assert not result.success and result.stop_reason == "target_activation_postcondition_failed"
+    assert result.target_activation_postcondition is not None
+    assert not result.target_activation_postcondition.trusted_context_stable
+    assert len(computer.postcondition_groundings) == 1
+    assert len(computer.executed) == 1
+
+
 def test_visual_failover_attempts_are_bounded_and_reported() -> None:
     after = observation("after")
-    visual = replace(
-        after,
-        visual_elements=(VisualElement(
-            "v1", "Alpha", "list item", Rect(10, 20, 150, 70), None, False,
-            activity="active",
-        ),),
-        visual_grounding_status=VisualGroundingStatus.SUCCESS_WITH_CANDIDATES,
-        visual_directed_grounding=True,
-        visual_provider_attempts=(
+    visual = replace(_visual_postcondition_observation("after", (VisualElement(
+        "v1", "Alpha", "text", Rect(420, 60, 700, 120), None, False,
+        activity="active", region=VisualRegion.HEADER,
+    ),)), visual_provider_attempts=(
             VisualProviderAttempt("gemini", "gemini-3.5-flash-lite", 30,
                                   "provider_failure", "timeout"),
             VisualProviderAttempt("openai", "gpt-5.6-luna", 40,
@@ -2523,3 +3708,363 @@ def test_generic_source_has_no_application_or_example_specific_branches() -> Non
     for path in paths:
         text = path.read_text(encoding="utf-8").casefold()
         assert not any(value in text for value in forbidden), path.name
+
+
+def _visual_target_run(
+    original: VisualElement,
+    fresh: Observation,
+    *,
+    context_matches: bool = True,
+    request: str | None = None,
+) -> tuple[object, FakeComputer]:
+    grounded = observation("grounded", visual=(original,))
+    computer = FakeComputer(
+        [observation("before"), active_conversation("after", original.label)],
+        [grounded], visual_provider=object(),
+    )
+    computer.context_matches = context_matches
+    computer.preclick_directed_observations.append(fresh)
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker(original.id)).run(
+        request or f"Select {original.label}",
+    )
+    return result, computer
+
+
+def test_visual_preclick_revalidation_stable_rebinds_to_fresh_snapshot() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    fresh = observation("fresh-stable", visual=(replace(original),))
+
+    result, computer = _visual_target_run(original, fresh)
+
+    diagnostic = result.visual_preclick_revalidation
+    assert result.success and diagnostic is not None
+    assert diagnostic.result.value == "STABLE"
+    assert diagnostic.source == "visual"
+    assert diagnostic.rebound_to_fresh_snapshot and diagnostic.click_released
+    assert diagnostic.geometry_changed is False
+    assert diagnostic.fresh_candidate_count == 1
+    assert diagnostic.admissible_fresh_candidate_count == 1
+    assert diagnostic.frontier_fresh_candidate_count == 1
+    assert diagnostic.original_target is not None
+    assert diagnostic.original_target.primary_identity == "Iago"
+    assert diagnostic.original_candidate is not None
+    assert diagnostic.original_candidate.provider_role == "conversation"
+    assert diagnostic.fresh_candidates[0].primary_identity_relation == "match"
+    assert diagnostic.fresh_candidates[0].considered_same_target
+    assert diagnostic.fresh_candidates[0].same_target_rejection_reason is None
+    assert diagnostic.original_candidate.semantic_role == "conversation"
+    assert diagnostic.fresh_candidates[0].semantic_role == "conversation"
+    assert len(computer.preclick_directed_calls) == 1
+    action, clicked_observation = computer.visual_activations[0]
+    assert action == VisualClickAction("fresh-stable", "v1")
+    assert clicked_observation is fresh
+
+
+@pytest.mark.parametrize(
+    ("fresh_top", "expected_bucket"),
+    [(220, "16_40_px"), (120, "41_100_px")],
+)
+def test_visual_preclick_revalidation_uses_fresh_geometry_after_vertical_shift(
+    fresh_top: int, expected_bucket: str,
+) -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    moved = VisualElement("v1", "Iago", "conversation", Rect(40, fresh_top, 300, fresh_top + 50), None, True)
+    # A neighbor occupies the original row after the shift. The executor only
+    # receives the current candidate rectangle from the fresh observation.
+    neighbor = VisualElement(
+        "v2", "Neighbor", "conversation", Rect(40, 180, 300, 230), None, True,
+    )
+    fresh = observation("fresh-moved", visual=(moved, neighbor))
+
+    result, computer = _visual_target_run(original, fresh)
+
+    diagnostic = result.visual_preclick_revalidation
+    assert result.success and diagnostic is not None
+    assert diagnostic.result.value == "MOVED"
+    assert diagnostic.geometry_changed is True
+    assert diagnostic.displacement_bucket == expected_bucket
+    assert diagnostic.rebound_to_fresh_snapshot and diagnostic.click_released
+    serialized = str(asdict(diagnostic))
+    assert all(key not in serialized for key in ("left", "top", "right", "bottom"))
+    assert len(computer.visual_activations) == 1
+    action, clicked_observation = computer.visual_activations[0]
+    assert action == VisualClickAction("fresh-moved", "v1")
+    assert clicked_observation.visual_elements[0].rectangle == moved.rectangle
+    assert clicked_observation.visual_elements[0].rectangle != original.rectangle
+
+
+def test_visual_preclick_revalidation_uses_unique_fresh_uia_target_without_visual_call() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    grounded = observation("grounded", visual=(original,))
+    fresh_local = observation(
+        "fresh-uia", elements=(conversation("c7", "Iago"),),
+    )
+    computer = FakeComputer(
+        [observation("before"), active_conversation("after", "Iago")],
+        [grounded], visual_provider=object(),
+    )
+    computer.preclick_local_observations.append(fresh_local)
+
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker("v1")).run("Select Iago")
+
+    diagnostic = result.visual_preclick_revalidation
+    assert result.success and diagnostic is not None
+    assert diagnostic.source == "UIA" and diagnostic.rebound_to_fresh_snapshot
+    assert diagnostic.result.value == "MOVED"
+    assert not computer.preclick_directed_calls
+    assert computer.executed[0][0] == ClickAction("c7")
+    assert computer.executed[0][1] is fresh_local
+
+
+def test_visual_preclick_revalidation_disappearance_and_ambiguity_fail_closed() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    disappeared = observation("fresh-gone", visual=(VisualElement(
+        "v2", "Other", "conversation", Rect(20, 80, 300, 130), None, True,
+    ),))
+    result_gone, computer_gone = _visual_target_run(original, disappeared)
+    assert not result_gone.success
+    assert result_gone.visual_preclick_revalidation is not None
+    assert result_gone.visual_preclick_revalidation.result.value == "DISAPPEARED"
+    assert result_gone.visual_preclick_revalidation.fresh_candidate_count == 1
+    assert result_gone.visual_preclick_revalidation.fresh_candidates[0].primary_identity_relation == "mismatch"
+    assert result_gone.visual_preclick_revalidation.fresh_candidates[0].same_target_rejection_reason == "primary_identity_mismatch"
+    assert not computer_gone.visual_activations
+
+    ambiguous = observation("fresh-ambiguous", visual=(
+        original,
+        VisualElement("v2", "Iago", "conversation", Rect(40, 260, 300, 310), None, True),
+    ))
+    result_ambiguous, computer_ambiguous = _visual_target_run(original, ambiguous)
+    assert not result_ambiguous.success
+    assert result_ambiguous.visual_preclick_revalidation is not None
+    assert result_ambiguous.visual_preclick_revalidation.result.value == "AMBIGUOUS"
+    assert result_ambiguous.visual_preclick_revalidation.fresh_candidate_count == 2
+    assert result_ambiguous.visual_preclick_revalidation.frontier_fresh_candidate_count == 2
+    assert all(row.considered_same_target for row in result_ambiguous.visual_preclick_revalidation.fresh_candidates)
+    assert not computer_ambiguous.visual_activations
+
+
+def test_visual_preclick_revalidation_reports_secondary_preview_and_same_identity() -> None:
+    original = VisualElement(
+        "v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True,
+    )
+    fresh_candidate = replace(original, parent="Iago sent: Nos vemos mañana")
+    result, computer = _visual_target_run(
+        original, observation("fresh-preview", visual=(fresh_candidate,)),
+    )
+
+    diagnostic = result.visual_preclick_revalidation
+    assert result.success and diagnostic is not None
+    assert diagnostic.result.value in {"STABLE", "MOVED"}
+    assert diagnostic.fresh_candidates[0].primary_text == "Iago"
+    assert diagnostic.fresh_candidates[0].secondary_text == ("Iago sent: Nos vemos mañana",)
+    assert diagnostic.fresh_candidates[0].primary_identity_relation == "match"
+    assert diagnostic.fresh_candidates[0].considered_same_target
+    assert len(computer.visual_activations) == 1
+
+
+def test_visual_preclick_role_wording_change_is_diagnosed_without_relaxing_match() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    fresh_candidate = replace(original, role="list item")
+    result, computer = _visual_target_run(
+        original, observation("fresh-role-wording", visual=(fresh_candidate,)),
+    )
+
+    diagnostic = result.visual_preclick_revalidation
+    assert not result.success and diagnostic is not None
+    assert diagnostic.result.value == "REJECTED"
+    candidate = diagnostic.fresh_candidates[0]
+    assert candidate.primary_identity_relation == "match"
+    assert candidate.provider_role == "list item"
+    assert candidate.presentation_role == "list_item"
+    assert candidate.presentation_compatibility == "compatible"
+    assert candidate.considered_same_target is False
+    assert candidate.same_target_rejection_reason == "semantic_role_continuity_unproven"
+    assert not computer.visual_activations
+
+
+def test_visual_preclick_unknown_semantic_role_continuity_accepts_compatible_presentation() -> None:
+    original = VisualElement("v1", "Iago", "list item", Rect(40, 180, 300, 230), None, True)
+    fresh = observation("fresh-null-role", visual=(replace(original),))
+    result, computer = _visual_target_run(
+        original, fresh,
+        request="Open WhatsApp and open the chat with Iago",
+    )
+
+    diagnostic = result.visual_preclick_revalidation
+    assert result.success and diagnostic is not None
+    assert diagnostic.result.value in {"STABLE", "MOVED"}
+    assert diagnostic.original_target is not None
+    assert diagnostic.original_target.desired_role == "conversation"
+    assert diagnostic.original_candidate is not None
+    assert diagnostic.original_candidate.semantic_role is None
+    assert diagnostic.original_candidate.presentation_role == "list_item"
+    assert diagnostic.original_candidate.presentation_compatibility == "compatible"
+    candidate = diagnostic.fresh_candidates[0]
+    assert candidate.semantic_role is None
+    assert candidate.role_compatibility == "unknown"
+    assert candidate.presentation_role == "list_item"
+    assert candidate.presentation_compatibility == "compatible"
+    assert candidate.considered_same_target
+    assert candidate.same_target_rejection_reason is None
+    assert len(computer.visual_activations) == 1
+
+
+def test_visual_preclick_unknown_semantic_role_with_incompatible_presentation_rejects() -> None:
+    original = VisualElement("v1", "Iago", "list item", Rect(40, 180, 300, 230), None, True)
+    fresh_candidate = replace(original, role="text field")
+    result, computer = _visual_target_run(
+        original, observation("fresh-incompatible-role", visual=(fresh_candidate,)),
+        request="Open WhatsApp and open the chat with Iago",
+    )
+
+    diagnostic = result.visual_preclick_revalidation
+    assert not result.success and diagnostic is not None
+    assert diagnostic.result.value == "REJECTED"
+    candidate = diagnostic.fresh_candidates[0]
+    assert candidate.primary_identity_relation == "match"
+    assert candidate.semantic_role is None
+    assert candidate.presentation_compatibility == "incompatible"
+    assert candidate.same_target_rejection_reason == "presentation_role_incompatible"
+    assert not computer.visual_activations
+
+
+def test_visual_preclick_known_semantic_role_conflict_rejects() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    fresh_candidate = replace(original, role="contact")
+    result, computer = _visual_target_run(
+        original, observation("fresh-known-role-conflict", visual=(fresh_candidate,)),
+    )
+
+    diagnostic = result.visual_preclick_revalidation
+    assert not result.success and diagnostic is not None
+    assert diagnostic.result.value == "REJECTED"
+    candidate = diagnostic.fresh_candidates[0]
+    assert candidate.semantic_role == "contact"
+    assert candidate.same_target_rejection_reason == "semantic_role_mismatch"
+    assert not computer.visual_activations
+
+
+def test_visual_preclick_qualifier_mismatch_rejects_same_identity() -> None:
+    target = TargetSpec(
+        "Iago", qualifiers=("Work",), desired_role="conversation", action_intent="select",
+    )
+    original = VisualElement(
+        "v1", "Iago", "list item", Rect(40, 180, 300, 230), None, True, parent="Work",
+    )
+    fresh_candidate = replace(original, parent="Family")
+    agent = GenericTaskDebugAgent(
+        FakeComputer([], visual_provider=object()), FakeDecisionMaker(),
+    )
+    original_resolution, _ = agent._resolve(
+        target, observation("qualified-original", visual=(original,)),
+    )
+    fresh_resolution, _ = agent._resolve(
+        target, observation("qualified-fresh", visual=(fresh_candidate,)),
+    )
+
+    reason = agent._preclick_candidate_rejection_reason(
+        target, original_resolution.candidates[0], fresh_resolution.candidates[0],
+    )
+
+    assert original_resolution.candidates[0].qualifier_evidence[0].value == "match"
+    assert fresh_resolution.candidates[0].primary_identity.value == "match"
+    assert fresh_resolution.candidates[0].qualifier_evidence[0].value == "mismatch"
+    assert reason == "qualifier_mismatch"
+
+
+def test_visual_preclick_same_identity_but_non_actionable_is_rejected_without_click() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    fresh_candidate = replace(original, clickable=False)
+    result, computer = _visual_target_run(
+        original, observation("fresh-disabled", visual=(fresh_candidate,)),
+    )
+
+    diagnostic = result.visual_preclick_revalidation
+    assert not result.success and diagnostic is not None
+    assert diagnostic.result.value == "REJECTED"
+    candidate = diagnostic.fresh_candidates[0]
+    assert candidate.primary_identity_relation == "match"
+    assert candidate.considered_same_target
+    assert candidate.actionable is False
+    assert candidate.admissible is False
+    assert not computer.visual_activations
+
+
+def test_visual_preclick_zero_provider_candidates_is_disappeared() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    grounded = observation("grounded-empty-test", visual=(original,))
+    screenshot = replace(grounded.screenshot, snapshot_id="fresh-zero")
+    fresh_empty = replace(
+        observation("fresh-zero"),
+        screenshot=screenshot,
+        visual_provider="fixture",
+        visual_directed_grounding=True,
+        visual_requested_max_elements=5,
+        visual_grounding_status=VisualGroundingStatus.SUCCESS_EMPTY,
+    )
+    computer = FakeComputer(
+        [observation("before"), active_conversation("after", "Iago")],
+        [grounded], visual_provider=object(),
+    )
+    computer.preclick_directed_observations.append(fresh_empty)
+
+    result = GenericTaskDebugAgent(computer, FakeDecisionMaker("v1")).run("Select Iago")
+
+    diagnostic = result.visual_preclick_revalidation
+    assert not result.success and diagnostic is not None
+    assert diagnostic.result.value == "DISAPPEARED"
+    assert diagnostic.fresh_candidate_count == 0
+    assert diagnostic.admissible_fresh_candidate_count == 0
+    assert diagnostic.frontier_fresh_candidate_count == 0
+    assert diagnostic.fresh_candidates == ()
+    assert not computer.visual_activations
+
+
+def test_visual_preclick_revalidation_context_change_and_provider_failure_fail_closed() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    fresh = observation("fresh-context", visual=(replace(original),))
+    result_context, computer_context = _visual_target_run(
+        original, fresh, context_matches=False,
+    )
+    assert not result_context.success
+    assert result_context.visual_preclick_revalidation is not None
+    assert result_context.visual_preclick_revalidation.result.value == "CONTEXT_CHANGED"
+    assert not computer_context.preclick_directed_calls
+    assert not computer_context.visual_activations
+
+    failed = replace(
+        observation("fresh-provider-failed"),
+        visual_directed_grounding=True,
+        visual_requested_max_elements=5,
+        visual_provider_error=ProviderErrorDiagnostic("timeout"),
+        visual_grounding_status=VisualGroundingStatus.PROVIDER_ERROR,
+        visual_provider_attempts=(VisualProviderAttempt("gemini", "test", 10, "timeout"),),
+    )
+    result_failed, computer_failed = _visual_target_run(original, failed)
+    assert not result_failed.success
+    assert result_failed.visual_preclick_revalidation is not None
+    assert result_failed.visual_preclick_revalidation.result.value == "INCOMPLETE"
+    assert len(result_failed.visual_preclick_revalidation.provider_attempts) == 1
+    assert not computer_failed.visual_activations
+
+
+def test_visual_preclick_click_failure_is_not_retried() -> None:
+    original = VisualElement("v1", "Iago", "conversation", Rect(40, 180, 300, 230), None, True)
+    fresh = observation("fresh-click-fails", visual=(replace(original),))
+    grounded = observation("grounded", visual=(original,))
+    failing = FakeComputer(
+        [observation("before"), active_conversation("after", "Iago")],
+        [grounded], visual_provider=object(),
+    )
+    failing.preclick_directed_observations.append(fresh)
+    failing.visual_click_result = ActionResult(
+        False, VisualClickAction("fresh-click-fails", "v1"), "synthetic failure",
+        error="windows_operation_failed", input_issued=False,
+    )
+    failed_result = GenericTaskDebugAgent(failing, FakeDecisionMaker("v1")).run("Select Iago")
+
+    assert not failed_result.success and failed_result.stop_reason == "target_activation_failed"
+    assert len(failing.visual_activations) == 1
+    assert failed_result.visual_preclick_revalidation is not None
+    assert failed_result.visual_preclick_revalidation.click_released is False

@@ -13,7 +13,8 @@ from computer.visual import (
 )
 from computer.visual_providers.common import (
     HTTPSJSONTransport, JSONTransport, candidate_from_normalized, directed_visual_prompt,
-    png_data_url, strict_visual_json, token_usage, visual_prompt, visual_schema,
+    png_data_url, strict_visual_field_value_json, strict_visual_json, token_usage,
+    visual_prompt, visual_schema,
 )
 
 
@@ -78,6 +79,8 @@ class OpenAIVisualObserver:
             directed_visual_prompt(
                 requested_max, grounding.objective,
                 verification_only=grounding.verification_only,
+                query_field_continuity=grounding.query_field_continuity,
+                field_value_only=grounding.field_value_only,
             )
             if grounding is not None else visual_prompt(requested_max, original_request)
         )
@@ -93,10 +96,19 @@ class OpenAIVisualObserver:
                 ],
             }],
             "text": {"format": {
-                "type": "json_schema", "name": "visible_ui_elements", "strict": True,
+                "type": "json_schema",
+                "name": ("visible_field_value" if grounding and grounding.field_value_only
+                         else "visible_ui_elements"),
+                "strict": True,
                 "schema": visual_schema(
                     include_parent=not directed,
                     include_activity=bool(grounding and grounding.verification_only),
+                    include_selection_state=bool(grounding and grounding.verification_only),
+                    include_region=bool(grounding and grounding.verification_only),
+                    include_query_field_continuity=bool(
+                        grounding and grounding.query_field_continuity
+                    ),
+                    include_field_value_only=bool(grounding and grounding.field_value_only),
                 ),
             }},
         }
@@ -104,15 +116,25 @@ class OpenAIVisualObserver:
         try:
             response = self.transport.create(payload, self._api_key, self.timeout)
             latency_ms = max(0, round((self._clock() - started) * 1000))
-            parsed = strict_visual_json(_output_text(response))
-            candidates = tuple(
-                candidate_from_normalized(
-                    raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
-                    parent_required=not directed,
-                    verification_only=bool(grounding and grounding.verification_only),
+            if grounding is not None and grounding.field_value_only:
+                field_value = strict_visual_field_value_json(_output_text(response))
+                parsed_elements = []
+                candidates = ()
+            else:
+                field_value = None
+                parsed = strict_visual_json(_output_text(response))
+                parsed_elements = parsed["elements"]
+                candidates = tuple(
+                    candidate_from_normalized(
+                        raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
+                        parent_required=not directed,
+                        verification_only=bool(grounding and grounding.verification_only),
+                        query_field_continuity=bool(
+                            grounding and grounding.query_field_continuity
+                        ),
+                    )
+                    for raw in parsed_elements[:requested_max]
                 )
-                for raw in parsed["elements"][:requested_max]
-            )
         except VisualProviderFailure as exc:
             raise exc.with_provider_context(self.name, self.model) from exc
         except (TimeoutError, socket.timeout) as exc:
@@ -129,8 +151,9 @@ class OpenAIVisualObserver:
             False, self.pricing_class,
             requested_max_elements=requested_max,
             returned_visual_elements=len(candidates), directed_grounding=directed,
-            raw_element_count=len(parsed["elements"]),
+            raw_element_count=len(parsed_elements),
             parsed_element_count=len(candidates),
+            field_value=field_value,
         )
 
 

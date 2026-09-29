@@ -189,6 +189,12 @@ def has_credential_sensitive_evidence(
                 return True
         for item in observation.visual_elements:
             texts.extend((item.label, item.role, item.parent))
+            if item.field_label is not None:
+                texts.append(item.field_label)
+            if item.field_value is not None:
+                texts.append(item.field_value)
+            if item.credential_risk is True:
+                return True
         for item in observation.visual_provider_candidates:
             texts.extend((item.label, item.role, item.parent))
         if (observation.visual_readiness is not None

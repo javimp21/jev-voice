@@ -18,7 +18,8 @@ from computer.visual import (
 from computer.visual_providers.common import (
     HTTPSJSONTransport, JSONTransport, MetadataTransport, candidate_from_normalized,
     chat_output_text, generic_http_error, png_data_url, strict_visual_json, token_usage,
-    redact_secrets, visual_prompt, visual_schema,
+    directed_visual_prompt, redact_secrets, strict_visual_field_value_json,
+    visual_prompt, visual_schema,
 )
 
 
@@ -33,6 +34,7 @@ _ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 _USER_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/models/user?limit=1000&output_modalities=text"
 _MODEL_ENDPOINTS_ROOT = "https://openrouter.ai/api/v1/models"
 _VISUAL_TOOL_NAME = "report_visible_ui_elements"
+_FIELD_VALUE_TOOL_NAME = "report_visible_field_value"
 
 
 def _provider_code(value: object) -> str | None:
@@ -194,21 +196,38 @@ class OpenRouterVisualObserver:
         )
         self._clock = clock
 
-    def _request_parameter_fields(self) -> dict[str, object]:
+    def _request_parameter_fields(
+        self, grounding: VisualGroundingRequest | None = None,
+    ) -> dict[str, object]:
         fields: dict[str, object] = {"temperature": 0, "max_tokens": 8000}
         if _MACHINE_READABLE_STRATEGIES[self.model] == "json_object":
             fields["response_format"] = {"type": "json_object"}
         else:
+            field_value_only = bool(grounding and grounding.field_value_only)
+            tool_name = _FIELD_VALUE_TOOL_NAME if field_value_only else _VISUAL_TOOL_NAME
             fields["tools"] = [{
                 "type": "function",
                 "function": {
-                    "name": _VISUAL_TOOL_NAME,
-                    "description": "Report useful visible interactive UI elements and their normalized boxes.",
-                    "parameters": visual_schema(),
+                    "name": tool_name,
+                    "description": (
+                        "Return only the currently visible text inside the supplied field crop."
+                        if field_value_only else
+                        "Report useful visible interactive UI elements and their normalized boxes."
+                    ),
+                    "parameters": visual_schema(
+                        include_parent=not bool(grounding and grounding.verification_only),
+                        include_activity=bool(grounding and grounding.verification_only),
+                        include_selection_state=bool(grounding and grounding.verification_only),
+                        include_region=bool(grounding and grounding.verification_only),
+                        include_query_field_continuity=bool(
+                            grounding and grounding.query_field_continuity
+                        ),
+                        include_field_value_only=field_value_only,
+                    ),
                 },
             }]
             fields["tool_choice"] = {
-                "type": "function", "function": {"name": _VISUAL_TOOL_NAME},
+                "type": "function", "function": {"name": tool_name},
             }
         return fields
 
@@ -338,7 +357,9 @@ class OpenRouterVisualObserver:
         )
 
     @staticmethod
-    def _tool_arguments(response: dict[str, object]) -> str:
+    def _tool_arguments(
+        response: dict[str, object], *, expected_name: str = _VISUAL_TOOL_NAME,
+    ) -> str:
         choices = response.get("choices")
         if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
             raise VisualProviderFailure("malformed_response")
@@ -347,7 +368,7 @@ class OpenRouterVisualObserver:
         if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
             raise VisualProviderFailure("malformed_response")
         function = calls[0].get("function")
-        if (not isinstance(function, dict) or function.get("name") != _VISUAL_TOOL_NAME
+        if (not isinstance(function, dict) or function.get("name") != expected_name
                 or not isinstance(function.get("arguments"), str)):
             raise VisualProviderFailure("malformed_response")
         return function["arguments"]
@@ -356,6 +377,8 @@ class OpenRouterVisualObserver:
         self, screenshot: ScreenshotCapture, window: Observation, original_request: str,
         grounding: VisualGroundingRequest | None = None,
     ) -> VisualObservation:
+        directed = grounding is not None
+        requested_max = grounding.max_elements if grounding is not None else self.max_elements
         provider_routing: dict[str, object] = {
             "allow_fallbacks": False,
             "require_parameters": True,
@@ -365,12 +388,20 @@ class OpenRouterVisualObserver:
         payload: dict[str, object] = {
             "model": self.model,
             "messages": [{"role": "user", "content": [
-                {"type": "text", "text": visual_prompt(self.max_elements, original_request)},
+                {"type": "text", "text": (
+                    directed_visual_prompt(
+                        requested_max, grounding.objective,
+                        verification_only=grounding.verification_only,
+                        query_field_continuity=grounding.query_field_continuity,
+                        field_value_only=grounding.field_value_only,
+                    ) if grounding is not None
+                    else visual_prompt(requested_max, original_request)
+                )},
                 {"type": "image_url", "image_url": {"url": png_data_url(screenshot)}},
             ]}],
             "provider": provider_routing,
         }
-        payload.update(self._request_parameter_fields())
+        payload.update(self._request_parameter_fields(grounding))
         strategy = _MACHINE_READABLE_STRATEGIES[self.model]
         started = self._clock()
         try:
@@ -383,13 +414,31 @@ class OpenRouterVisualObserver:
             raise VisualProviderFailure("unknown_api_error") from exc
         latency_ms = max(0, round((self._clock() - started) * 1000))
         try:
-            output = (chat_output_text(response) if strategy == "json_object"
-                      else self._tool_arguments(response))
-            parsed = strict_visual_json(output)
-            candidates = tuple(
-                candidate_from_normalized(raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height)
-                for raw in parsed["elements"][:self.max_elements]
-            )
+            if grounding is not None and grounding.field_value_only:
+                output = (chat_output_text(response) if strategy == "json_object"
+                          else self._tool_arguments(
+                              response, expected_name=_FIELD_VALUE_TOOL_NAME,
+                          ))
+                field_value = strict_visual_field_value_json(output)
+                parsed_elements = []
+                candidates = ()
+            else:
+                output = (chat_output_text(response) if strategy == "json_object"
+                          else self._tool_arguments(response))
+                field_value = None
+                parsed = strict_visual_json(output)
+                parsed_elements = parsed["elements"]
+                candidates = tuple(
+                    candidate_from_normalized(
+                        raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
+                        parent_required=not bool(grounding and grounding.verification_only),
+                        verification_only=bool(grounding and grounding.verification_only),
+                        query_field_continuity=bool(
+                            grounding and grounding.query_field_continuity
+                        ),
+                    )
+                    for raw in parsed_elements[:requested_max]
+                )
         except VisualProviderFailure as exc:
             if exc.code == "invalid_response":
                 raise VisualProviderFailure("malformed_response") from exc
@@ -398,4 +447,10 @@ class OpenRouterVisualObserver:
             candidates, self.name, self.model, latency_ms,
             token_usage(response, ("prompt_tokens", "completion_tokens", "total_tokens")),
             False, self.pricing_class,
+            requested_max_elements=requested_max,
+            returned_visual_elements=len(candidates),
+            directed_grounding=directed,
+            raw_element_count=len(parsed_elements),
+            parsed_element_count=len(candidates),
+            field_value=field_value,
         )

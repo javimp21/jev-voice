@@ -39,6 +39,14 @@ def _attempt(
     )
 
 
+def _success_result_class(
+    result: VisualObservation, grounding: VisualGroundingRequest | None,
+) -> str:
+    if grounding is not None and grounding.field_value_only:
+        return "value_read_success" if result.field_value is not None else "value_read_empty"
+    return "success_with_candidates" if result.candidates else "success_empty"
+
+
 class GeminiVisualGrounder(GeminiVisualObserver):
     """Gemini primary that may call OpenAI once after a recoverable provider failure."""
 
@@ -77,7 +85,7 @@ class GeminiVisualGrounder(GeminiVisualObserver):
         else:
             attempts.append(_attempt(
                 primary.provider, primary.model, primary.latency_ms or 0,
-                result_class=("success_with_candidates" if primary.candidates else "success_empty"),
+                result_class=_success_result_class(primary, grounding),
             ))
             return replace(primary, provider_attempts=tuple(attempts))
 
@@ -119,7 +127,7 @@ class GeminiVisualGrounder(GeminiVisualObserver):
         elapsed = max(0, round((self._failover_clock() - fallback_started) * 1000))
         attempts.append(_attempt(
             secondary.provider, secondary.model, elapsed,
-            result_class=("success_with_candidates" if secondary.candidates else "success_empty"),
+            result_class=_success_result_class(secondary, grounding),
         ))
         return replace(
             secondary, provider_attempts=tuple(attempts),

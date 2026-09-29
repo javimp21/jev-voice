@@ -475,6 +475,146 @@ def test_lifecycle_reports_background_and_minimized_target_windows() -> None:
     assert minimized_state.foreground is False
 
 
+def test_launch_timing_records_window_milestones_and_immediate_eligible_attempt() -> None:
+    clock = FakeClock()
+    clock.value = 0.05  # OpenAppAction returned after 50 ms.
+    first_probe = TrustedApplicationRuntimeState(
+        process_observed=True,
+        trusted_identity_match=True,
+        probe_complete=True,
+        enumeration_complete=True,
+        primary_surface_candidate_count=0,
+        primary_surface_resolution_status="none",
+    )
+    primary_facts = EligibleWindowFacts(
+        visible=True,
+        minimized=False,
+        enabled=True,
+        cloaked_state="uncloaked",
+        owner_present=False,
+        root_owner_relationship="self",
+        tool_window=False,
+        app_window=False,
+        has_nonzero_client_area=True,
+        client_area_bucket="large",
+        window_area_bucket="large",
+        foreground=False,
+        stable_across_probes=True,
+        explicit_activation_eligible=True,
+        eligibility_reason="eligible",
+    )
+    second_probe = TrustedApplicationRuntimeState(
+        process_observed=True,
+        window_observed=True,
+        visible=True,
+        minimized=False,
+        window_foreground=False,
+        trusted_identity_match=True,
+        probe_complete=True,
+        window_stable=True,
+        window_resolution_status="unique",
+        matching_trusted_window_count=1,
+        eligible_window_count=1,
+        enumeration_complete=True,
+        eligible_window_diagnostics=(EligibleWindowDiagnostics(
+            "ew1", 1, primary_facts, surface_class="primary",
+        ),),
+        primary_surface_candidate_count=1,
+        primary_surface_resolution_status="unique",
+        primary_surface_facts=primary_facts,
+    )
+    probes = iter((first_probe, second_probe))
+    activation_calls: list[float] = []
+
+    result = wait_for_trusted_application_activation(
+        ObservationSequence([
+            foreground("old-1", app_id="other-app"),
+            foreground("old-2", app_id="other-app"),
+            foreground("old-after-attempt", app_id="other-app"),
+        ]),
+        candidate(),
+        initial_observation=foreground("initial", app_id="other-app"),
+        launch_succeeded=True,
+        timeout_seconds=0.4,
+        poll_interval_seconds=0.2,
+        clock=clock,
+        sleep_fn=clock.sleep,
+        target_probe=lambda: next(probes),
+        target_activator=lambda: activation_calls.append(clock()) or TrustedWindowActivationResult(
+            True, "eligible", mechanism="activate", budget_consumed=True,
+            foreground_verified=False, failure_reason="os_activation_rejected",
+        ),
+        open_app_action_started_at=0.0,
+        open_app_action_elapsed_ms=50,
+    )
+
+    assert result.lifecycle is not None
+    timing = result.lifecycle.timing
+    assert timing is not None
+    assert timing.open_app_action_elapsed_ms == 50
+    assert timing.activation_wait_started_since_launch_ms == 50
+    assert timing.first_process_since_launch_ms == 50
+    assert timing.first_primary_window_since_launch_ms == 250
+    assert timing.first_visible_primary_window_since_launch_ms == 250
+    assert timing.first_stable_eligible_window_since_launch_ms == 250
+    assert timing.explicit_activation_attempt_since_launch_ms == 250
+    assert timing.eligible_to_attempt_delay_ms == 0
+    assert len(activation_calls) == 1
+
+
+def test_launch_timing_records_request_observation_probe_and_foreground_transition() -> None:
+    clock = FakeClock()
+    clock.value = 0.02  # The launcher returned 20 ms after its request started.
+    observations = iter((
+        foreground("after-launch-old", app_id="other-app"),
+        foreground("after-launch-target", app_id=APP_ID, pid=20, hwnd=200),
+    ))
+
+    def observe() -> Observation:
+        clock.value += 0.03
+        return next(observations)
+
+    probe_states = iter((
+        TrustedApplicationRuntimeState(
+            process_observed=True, trusted_identity_match=True, probe_complete=True,
+        ),
+        TrustedApplicationRuntimeState(
+            process_observed=True, window_observed=True, foreground_observed=True,
+            visible=True, minimized=False, window_foreground=True,
+            trusted_identity_match=True, probe_complete=True,
+        ),
+    ))
+
+    def probe() -> TrustedApplicationRuntimeState:
+        clock.value += 0.04
+        return next(probe_states)
+
+    result = wait_for_trusted_application_activation(
+        observe, candidate(), initial_observation=foreground("before", app_id="other-app"),
+        launch_succeeded=True, timeout_seconds=1, poll_interval_seconds=.2,
+        clock=clock, sleep_fn=clock.sleep, target_probe=probe,
+        target_activator=lambda: pytest.fail("passive foreground must skip activation"),
+        open_app_action_started_at=0.0, open_app_action_elapsed_ms=20,
+    )
+
+    assert result.lifecycle is not None and result.lifecycle.timing is not None
+    timing = result.lifecycle.timing
+    assert timing.launch_request_started_since_launch_ms == 0
+    assert timing.launch_request_finished_since_launch_ms == 20
+    assert timing.post_launch_setup_delay_ms == 0
+    assert timing.foreground_identity_before_launch.trusted_app_id == "other-app"
+    assert timing.first_post_launch_foreground_identity.trusted_app_id == "other-app"
+    assert timing.first_post_launch_observation_started_since_launch_ms == 20
+    assert timing.first_post_launch_observation_finished_since_launch_ms == 50
+    assert timing.first_post_launch_target_probe_started_since_launch_ms == 50
+    assert timing.first_post_launch_target_probe_finished_since_launch_ms == 90
+    assert timing.first_foreground_since_launch_ms == 360
+    assert len(timing.foreground_transitions_since_launch) == 1
+    transition = timing.foreground_transitions_since_launch[0]
+    assert transition.elapsed_since_launch_ms == 320
+    assert transition.identity.trusted_app_id == APP_ID
+
+
 def test_lifecycle_records_foreground_success_without_pid_equality() -> None:
     clock = FakeClock()
     active = foreground("active", app_id=APP_ID, pid=999, hwnd=200, app_name="trusted.exe")

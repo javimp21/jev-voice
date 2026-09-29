@@ -589,6 +589,41 @@ def test_run_agent_dry_run_never_prompts_or_executes(
     computer.execute.assert_not_called()
 
 
+def test_run_agent_graph_debug_dry_run_uses_graph_and_redacts_request_and_literal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    catalog = MemoryApplicationCatalog(())
+    observation = Observation("test.exe", "Test Window", observation_id="obs-safe-id")
+    computer = Mock()
+    computer.observe.return_value = observation
+    decision = Mock(min_confidence=0.8)
+    secret = "graph-secret-literal"
+    decision.decide.return_value = DecisionResult(
+        "ready", TypeAction(secret), 0.95, "selected", selected_option="type_1",
+    )
+    monkeypatch.setattr(cli, "visual_provider_from_environment", Mock(return_value=None))
+    monkeypatch.setattr(cli, "WindowsApplicationCatalog", Mock(return_value=catalog))
+    monkeypatch.setattr(cli, "WindowsComputer", Mock(return_value=computer))
+    monkeypatch.setattr(cli.JevDecisionMaker, "from_environment", Mock(return_value=decision))
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda: (_ for _ in ()).throw(AssertionError("dry-run must not prompt")),
+    )
+
+    assert cli.main(["run-agent-graph-debug", secret, "--dry-run"]) == 0
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    assert output["stop_reason"] == "needs_human"
+    assert output["replan_count"] == 0
+    assert output["max_replans"] == 1
+    assert output["last_replan_reason"] is None
+    assert output["graph"]["node_sequence"] == [
+        "OBSERVE", "DECIDE", "SAFETY_CHECK", "FINISH",
+    ]
+    assert secret not in captured.out + captured.err
+    computer.execute.assert_not_called()
+
+
 def test_run_agent_requires_explicit_yes_for_real_run(monkeypatch: pytest.MonkeyPatch) -> None:
     decision = Mock()
     monkeypatch.setattr(cli.JevDecisionMaker, "from_environment", lambda _catalog=None: decision)

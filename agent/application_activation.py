@@ -59,6 +59,37 @@ class PostDeadlineProbeDiagnostics:
 
 
 @dataclass(frozen=True, slots=True)
+class ForegroundTransitionDiagnostic:
+    elapsed_since_launch_ms: int
+    identity: ForegroundIdentity
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationTimingDiagnostics:
+    """Coarse launch-to-foreground milestones; contains no process/window IDs."""
+
+    open_app_action_elapsed_ms: int | None
+    activation_wait_started_since_launch_ms: int
+    first_process_since_launch_ms: int | None
+    first_primary_window_since_launch_ms: int | None
+    first_visible_primary_window_since_launch_ms: int | None
+    first_foreground_since_launch_ms: int | None
+    first_stable_eligible_window_since_launch_ms: int | None
+    explicit_activation_attempt_since_launch_ms: int | None
+    eligible_to_attempt_delay_ms: int | None
+    launch_request_started_since_launch_ms: int | None
+    launch_request_finished_since_launch_ms: int | None
+    post_launch_setup_delay_ms: int | None
+    foreground_identity_before_launch: ForegroundIdentity | None
+    first_post_launch_foreground_identity: ForegroundIdentity | None
+    first_post_launch_observation_started_since_launch_ms: int | None
+    first_post_launch_observation_finished_since_launch_ms: int | None
+    first_post_launch_target_probe_started_since_launch_ms: int | None
+    first_post_launch_target_probe_finished_since_launch_ms: int | None
+    foreground_transitions_since_launch: tuple[ForegroundTransitionDiagnostic, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ActivationLifecycleDiagnostics:
     launch_request_accepted: bool
     target_probe_available: bool
@@ -87,6 +118,7 @@ class ActivationLifecycleDiagnostics:
     primary_surface_candidate_count: int = 0
     tool_surface_candidate_count: int = 0
     primary_surface_resolution: WindowResolutionStatus = "incomplete"
+    timing: ActivationTimingDiagnostics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -396,6 +428,8 @@ def wait_for_trusted_application_activation(
     target_probe: Callable[[], TrustedApplicationRuntimeState] | None = None,
     target_activator: Callable[[], TrustedWindowActivationResult] | None = None,
     post_deadline_probe_seconds: float = 0,
+    open_app_action_started_at: float | None = None,
+    open_app_action_elapsed_ms: int | None = None,
 ) -> ApplicationActivationWait:
     """Poll passively, with one optional verified-window activation inside the deadline."""
     if not 0 <= timeout_seconds <= 15:
@@ -409,6 +443,29 @@ def wait_for_trusted_application_activation(
 
     started = clock()
     deadline = started + timeout_seconds
+    launch_timing_enabled = open_app_action_started_at is not None
+    activation_wait_started_since_launch_ms = (
+        max(0, round((started - open_app_action_started_at) * 1000))
+        if open_app_action_started_at is not None else None
+    )
+    first_process_since_launch_ms: int | None = None
+    first_primary_window_since_launch_ms: int | None = None
+    first_visible_primary_window_since_launch_ms: int | None = None
+    first_foreground_since_launch_ms: int | None = None
+    first_stable_eligible_window_since_launch_ms: int | None = None
+    explicit_activation_attempt_since_launch_ms: int | None = None
+    first_post_launch_foreground_identity: ForegroundIdentity | None = None
+    first_post_launch_observation_started_since_launch_ms: int | None = None
+    first_post_launch_observation_finished_since_launch_ms: int | None = None
+    first_post_launch_target_probe_started_since_launch_ms: int | None = None
+    first_post_launch_target_probe_finished_since_launch_ms: int | None = None
+    foreground_transitions_since_launch: list[ForegroundTransitionDiagnostic] = []
+
+    def launch_elapsed_ms() -> int | None:
+        if open_app_action_started_at is None:
+            return None
+        return max(0, round((clock() - open_app_action_started_at) * 1000))
+
     latest: Observation | None = None
     attempts = 0
     transitions: list[ForegroundIdentity] = []
@@ -445,15 +502,26 @@ def wait_for_trusted_application_activation(
 
     def read_target_state() -> TrustedApplicationRuntimeState | None:
         nonlocal target_probe_available, target_probe_complete, last_target_state
+        nonlocal first_post_launch_target_probe_started_since_launch_ms
+        nonlocal first_post_launch_target_probe_finished_since_launch_ms
         if target_probe is None:
             return None
+        if (launch_timing_enabled
+                and first_post_launch_target_probe_started_since_launch_ms is None):
+            first_post_launch_target_probe_started_since_launch_ms = launch_elapsed_ms()
         try:
             state = target_probe()
         except KeyboardInterrupt:
             raise
         except Exception:
+            if (launch_timing_enabled
+                    and first_post_launch_target_probe_finished_since_launch_ms is None):
+                first_post_launch_target_probe_finished_since_launch_ms = launch_elapsed_ms()
             target_probe_complete = False
             return None
+        if (launch_timing_enabled
+                and first_post_launch_target_probe_finished_since_launch_ms is None):
+            first_post_launch_target_probe_finished_since_launch_ms = launch_elapsed_ms()
         if not isinstance(state, TrustedApplicationRuntimeState):
             target_probe_complete = False
             return None
@@ -565,6 +633,8 @@ def wait_for_trusted_application_activation(
         nonlocal target_process_observed, target_window_observed
         nonlocal target_foreground_observed, first_target_process_elapsed_ms
         nonlocal first_target_window_elapsed_ms, first_target_foreground_elapsed_ms
+        nonlocal first_process_since_launch_ms, first_primary_window_since_launch_ms
+        nonlocal first_visible_primary_window_since_launch_ms, first_foreground_since_launch_ms
         nonlocal target_window_state
         nonlocal matching_window_candidates, candidate_diagnostics_truncated
         nonlocal window_resolution_status, matching_trusted_window_count
@@ -621,6 +691,26 @@ def wait_for_trusted_application_activation(
             process_seen = state.process_observed
             window_seen = state.window_observed
             foreground_seen = state.foreground_observed
+            launch_elapsed = launch_elapsed_ms()
+            if (launch_elapsed is not None and process_seen
+                    and first_process_since_launch_ms is None):
+                first_process_since_launch_ms = launch_elapsed
+            primary_count = state.primary_surface_candidate_count
+            if (launch_elapsed is not None and type(primary_count) is int and primary_count > 0):
+                if first_primary_window_since_launch_ms is None:
+                    first_primary_window_since_launch_ms = launch_elapsed
+                visible_primary = (
+                    state.primary_surface_facts is not None
+                    and state.primary_surface_facts.visible is True
+                ) or any(
+                    isinstance(item, EligibleWindowDiagnostics)
+                    and item.surface_class == "primary"
+                    and item.facts.visible is True
+                    for item in state.eligible_window_diagnostics
+                )
+                if (visible_primary
+                        and first_visible_primary_window_since_launch_ms is None):
+                    first_visible_primary_window_since_launch_ms = launch_elapsed
             if process_seen and first_target_process_elapsed_ms is None:
                 first_target_process_elapsed_ms = elapsed
             if window_seen and first_target_window_elapsed_ms is None:
@@ -630,6 +720,8 @@ def wait_for_trusted_application_activation(
             target_process_observed |= process_seen
             target_window_observed |= window_seen
             target_foreground_observed |= foreground_seen
+            if foreground_seen and launch_elapsed is not None and first_foreground_since_launch_ms is None:
+                first_foreground_since_launch_ms = launch_elapsed
             target_window_state = (
                 ActivationTargetWindowState(
                     state.visible, state.minimized, state.window_foreground, True,
@@ -889,13 +981,26 @@ def wait_for_trusted_application_activation(
 
     if launch_succeeded:
         while True:
+            if (launch_timing_enabled
+                    and first_post_launch_observation_started_since_launch_ms is None):
+                first_post_launch_observation_started_since_launch_ms = launch_elapsed_ms()
             try:
                 latest = observe_local()
             except KeyboardInterrupt:
                 raise
             except Exception:
+                if (launch_timing_enabled
+                        and first_post_launch_observation_finished_since_launch_ms is None):
+                    first_post_launch_observation_finished_since_launch_ms = launch_elapsed_ms()
                 reason = "observation_failed"
                 break
+            if (launch_timing_enabled
+                    and first_post_launch_observation_finished_since_launch_ms is None):
+                first_post_launch_observation_finished_since_launch_ms = launch_elapsed_ms()
+            observation_elapsed = launch_elapsed_ms()
+            if (launch_timing_enabled
+                    and first_post_launch_foreground_identity is None):
+                first_post_launch_foreground_identity = _foreground_identity(latest)
             attempts += 1
             target_state = read_target_state()
             note_activation_state(target_state)
@@ -905,6 +1010,12 @@ def wait_for_trusted_application_activation(
                 identity = _foreground_identity(latest)
                 if identity is not None:
                     transitions.append(identity)
+                    if (launch_timing_enabled and observation_elapsed is not None
+                            and len(foreground_transitions_since_launch)
+                            < max_recorded_transitions):
+                        foreground_transitions_since_launch.append(
+                            ForegroundTransitionDiagnostic(observation_elapsed, identity),
+                        )
             previous_signature = signature
             # The catalog-derived app ID is authoritative. Launcher and final
             # foreground PIDs may differ for packaged apps and activation brokers.
@@ -922,6 +1033,9 @@ def wait_for_trusted_application_activation(
                     first_target_window_elapsed_ms = elapsed_ms()
                 if first_target_foreground_elapsed_ms is None:
                     first_target_foreground_elapsed_ms = elapsed_ms()
+                launch_elapsed = launch_elapsed_ms()
+                if launch_elapsed is not None and first_foreground_since_launch_ms is None:
+                    first_foreground_since_launch_ms = launch_elapsed
                 if target_window_state is None:
                     target_window_state = ActivationTargetWindowState(
                         None, None, True, True,
@@ -931,6 +1045,9 @@ def wait_for_trusted_application_activation(
             if target_activator is not None and not explicit_attempted:
                 eligible, eligibility_reason, before_state = target_eligibility(target_state)
                 if eligible:
+                    if (launch_timing_enabled
+                            and first_stable_eligible_window_since_launch_ms is None):
+                        first_stable_eligible_window_since_launch_ms = launch_elapsed_ms()
                     if clock() >= deadline:
                         explicit_diagnostics = sanitized_explicit_diagnostics(
                             eligible=False, eligibility_reason="deadline_expired",
@@ -946,6 +1063,9 @@ def wait_for_trusted_application_activation(
                         # no later poll can retry. The Windows adapter consumes its
                         # OS-call budget only after its own resolve/revalidate phase.
                         explicit_attempted = True
+                        if (launch_timing_enabled
+                                and explicit_activation_attempt_since_launch_ms is None):
+                            explicit_activation_attempt_since_launch_ms = launch_elapsed_ms()
                         activation_result: TrustedWindowActivationResult
                         try:
                             activation_result = target_activator()
@@ -982,12 +1102,22 @@ def wait_for_trusted_application_activation(
                         if fresh_observation is not None:
                             attempts += 1
                             latest = fresh_observation
+                            fresh_observation_elapsed = launch_elapsed_ms()
                             signature = _foreground_signature(latest)
                             if (signature is not None and signature != previous_signature
                                     and len(transitions) < max_recorded_transitions):
                                 identity = _foreground_identity(latest)
                                 if identity is not None:
                                     transitions.append(identity)
+                                    if (launch_timing_enabled
+                                            and fresh_observation_elapsed is not None
+                                            and len(foreground_transitions_since_launch)
+                                            < max_recorded_transitions):
+                                        foreground_transitions_since_launch.append(
+                                            ForegroundTransitionDiagnostic(
+                                                fresh_observation_elapsed, identity,
+                                            ),
+                                        )
                             previous_signature = signature
 
                         trusted_after = (
@@ -1018,6 +1148,10 @@ def wait_for_trusted_application_activation(
                                 first_target_window_elapsed_ms = elapsed_ms()
                             if first_target_foreground_elapsed_ms is None:
                                 first_target_foreground_elapsed_ms = elapsed_ms()
+                            launch_elapsed = launch_elapsed_ms()
+                            if (launch_elapsed is not None
+                                    and first_foreground_since_launch_ms is None):
+                                first_foreground_since_launch_ms = launch_elapsed
                             target_window_state = ActivationTargetWindowState(
                                 activation_result.visible, activation_result.minimized,
                                 True, True,
@@ -1162,6 +1296,61 @@ def wait_for_trusted_application_activation(
     )
     lifecycle = None
     if target_probe is not None or post_deadline_probe_seconds > 0 or target_activator is not None:
+        timing = None
+        if launch_timing_enabled:
+            eligible_at = first_stable_eligible_window_since_launch_ms
+            attempted_at = explicit_activation_attempt_since_launch_ms
+            timing = ActivationTimingDiagnostics(
+                open_app_action_elapsed_ms=(
+                    open_app_action_elapsed_ms
+                    if type(open_app_action_elapsed_ms) is int
+                    and 0 <= open_app_action_elapsed_ms <= 15_000 else None
+                ),
+                activation_wait_started_since_launch_ms=(
+                    activation_wait_started_since_launch_ms
+                    if activation_wait_started_since_launch_ms is not None else 0
+                ),
+                first_process_since_launch_ms=first_process_since_launch_ms,
+                first_primary_window_since_launch_ms=first_primary_window_since_launch_ms,
+                first_visible_primary_window_since_launch_ms=(
+                    first_visible_primary_window_since_launch_ms
+                ),
+                first_foreground_since_launch_ms=first_foreground_since_launch_ms,
+                first_stable_eligible_window_since_launch_ms=eligible_at,
+                explicit_activation_attempt_since_launch_ms=attempted_at,
+                eligible_to_attempt_delay_ms=(
+                    max(0, attempted_at - eligible_at)
+                    if eligible_at is not None and attempted_at is not None else None
+                ),
+                launch_request_started_since_launch_ms=0,
+                launch_request_finished_since_launch_ms=(
+                    open_app_action_elapsed_ms
+                    if type(open_app_action_elapsed_ms) is int
+                    and 0 <= open_app_action_elapsed_ms <= 60_000 else None
+                ),
+                post_launch_setup_delay_ms=(
+                    max(0, activation_wait_started_since_launch_ms - open_app_action_elapsed_ms)
+                    if (type(open_app_action_elapsed_ms) is int
+                        and 0 <= open_app_action_elapsed_ms <= 60_000) else None
+                ),
+                foreground_identity_before_launch=_foreground_identity(initial_observation),
+                first_post_launch_foreground_identity=first_post_launch_foreground_identity,
+                first_post_launch_observation_started_since_launch_ms=(
+                    first_post_launch_observation_started_since_launch_ms
+                ),
+                first_post_launch_observation_finished_since_launch_ms=(
+                    first_post_launch_observation_finished_since_launch_ms
+                ),
+                first_post_launch_target_probe_started_since_launch_ms=(
+                    first_post_launch_target_probe_started_since_launch_ms
+                ),
+                first_post_launch_target_probe_finished_since_launch_ms=(
+                    first_post_launch_target_probe_finished_since_launch_ms
+                ),
+                foreground_transitions_since_launch=tuple(
+                    foreground_transitions_since_launch
+                ),
+            )
         lifecycle = ActivationLifecycleDiagnostics(
             launch_request_accepted=launch_succeeded,
             target_probe_available=target_probe_available,
@@ -1190,5 +1379,6 @@ def wait_for_trusted_application_activation(
             primary_surface_candidate_count=primary_surface_candidate_count,
             tool_surface_candidate_count=tool_surface_candidate_count,
             primary_surface_resolution=primary_surface_resolution,
+            timing=timing,
         )
     return ApplicationActivationWait(latest, diagnostics, reason, lifecycle)

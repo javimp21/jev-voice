@@ -149,10 +149,12 @@ def test_openai_fallback_grounder_uses_same_directed_objective_and_candidate_lim
     screenshot.discard()
 
 
-def test_openai_activation_verification_uses_structured_activity_evidence() -> None:
+def test_openai_activation_verification_uses_structured_active_context_evidence() -> None:
     item = element(label="Iago", role="list_item", parent="")
     item.pop("parent")
     item["activity"] = "active"
+    item["selection_state"] = "selected"
+    item["region"] = "header"
     provider, transport = observer(response([item]))
     screenshot = capture()
     grounding = VisualGroundingRequest(
@@ -167,10 +169,84 @@ def test_openai_activation_verification_uses_structured_activity_evidence() -> N
     schema = payload["text"]["format"]["schema"]["properties"]["elements"]["items"]
     assert "currently active, opened, or selected" in prompt
     assert schema["properties"]["activity"]["enum"] == ["active", "not_active", "unknown"]
+    assert schema["properties"]["selection_state"]["enum"] == [
+        "selected", "not_selected", "unknown",
+    ]
+    assert schema["properties"]["region"]["enum"] == [
+        "navigation", "detail", "header", "content", "unknown",
+    ]
     assert "activity" in schema["required"]
+    assert "selection_state" in schema["required"] and "region" in schema["required"]
     assert "parent" not in schema["properties"]
     assert result.candidates[0].activity == "active"
+    assert result.candidates[0].selection_state.value == "selected"
+    assert result.candidates[0].region.value == "header"
     assert result.execution_authorized is False
+    screenshot.discard()
+
+
+def test_openai_query_continuity_returns_label_and_field_value_separately() -> None:
+    raw = {
+        "field_label": "¿Qué quieres reproducir?",
+        "field_value": "Californication",
+        "role": "search_field",
+        "box": {"left": 100, "top": 100, "right": 300, "bottom": 300},
+        "clickable": True,
+        "activity": "active",
+        "is_query_field": True,
+        "credential_risk": False,
+    }
+    provider, transport = observer(response([raw]))
+    screenshot = capture()
+    grounding = VisualGroundingRequest(
+        "Verify the active query field contains Californication.", 5,
+        verification_only=True, query_field_continuity=True,
+    )
+
+    result = provider.observe(screenshot, Observation("app", "Window"), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["input"][0]["content"][0]["text"]
+    schema = payload["text"]["format"]["schema"]["properties"]["elements"]["items"]
+    assert "placeholder" in prompt and "field_value separately" in prompt
+    assert "nearby results" in prompt and "search history" in prompt
+    assert set(schema["properties"]) == {
+        "field_label", "field_value", "role", "box", "clickable", "activity",
+        "is_query_field", "credential_risk",
+    }
+    assert schema["properties"]["field_label"]["type"] == ["string", "null"]
+    assert schema["properties"]["field_value"]["type"] == ["string", "null"]
+    assert result.candidates[0].field_label == "¿Qué quieres reproducir?"
+    assert result.candidates[0].field_value == "Californication"
+    assert result.candidates[0].is_query_field is True
+    assert result.candidates[0].credential_risk is False
+    screenshot.discard()
+
+
+def test_openai_value_only_read_uses_strict_field_value_schema_and_prompt() -> None:
+    provider, transport = observer(response([]))
+    transport.create.return_value = {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{
+            "type": "output_text", "text": json.dumps({"field_value": "Californication"}),
+        }]}],
+    }
+    screenshot = capture()
+    grounding = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+
+    result = provider.observe(screenshot, Observation("app", "Window"), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["input"][0]["content"][0]["text"]
+    schema = payload["text"]["format"]["schema"]
+    assert payload["text"]["format"]["name"] == "visible_field_value"
+    assert schema["required"] == ["field_value"]
+    assert set(schema["properties"]) == {"field_value"}
+    assert "nearby results" in prompt and "Do not identify" in prompt
+    assert result.candidates == () and result.field_value == "Californication"
     screenshot.discard()
 
 

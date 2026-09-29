@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from PIL import Image
 
 from computer.actions import ClickAction, TypeAction, VisualClickAction
 from computer.models import (
@@ -18,7 +19,7 @@ from computer.models import (
 )
 from computer.visual import (
     FakeVisualObserver, ScreenshotCapture, VisualCandidate, VisualGroundingRequest, VisualObservation,
-    VisualProviderFailure,
+    VisualProviderFailure, crop_screenshot_to_field,
     deduplicate_visual_elements, deduplicate_visual_elements_within,
     validate_visual_candidates, visual_click_point, visual_fallback_policy, visual_rect_to_screen,
     ResultReadinessOptions, VisualReadinessOptions, bounded_grounding_request, visual_frame_is_informative,
@@ -32,6 +33,9 @@ from computer.windows_capture import CaptureUnavailable, WindowsWindowCapture
 from computer.windows_capture import save_debug_overlay, save_debug_screenshot
 from decision.jev import JevDecisionMaker
 from safety.policy import AutonomousActionPolicy, BasicActionPolicy, Phase1VisualClickPolicy
+from computer.visual_providers.common import (
+    directed_visual_prompt, strict_visual_field_value_json, visual_schema,
+)
 
 
 def test_result_readiness_frame_comparison_is_bounded_and_deterministic() -> None:
@@ -80,6 +84,142 @@ def test_visual_candidate_validation_assigns_snapshot_local_ids() -> None:
     assert BasicActionPolicy().validate(
         VisualClickAction("one", "v1"), replace(observation_with_visual(first[0]), observation_id="two"),
     ).disposition == "deny"
+
+
+def test_field_value_crop_is_bounded_and_derived_from_local_rectangle() -> None:
+    bounds = Rect(0, 0, 1000, 800)
+    meta = ScreenshotMetadata("crop-source", 99, bounds, bounds, 1000, 800, 96, 96, 1, 1)
+    source = ScreenshotCapture(meta, Image.new("RGB", (1000, 800), "red"))
+    crop = crop_screenshot_to_field(source, Rect(100, 200, 300, 240))
+
+    assert crop.image.size == (210, 50)
+    assert crop.metadata.capture_bounds == Rect(95, 195, 305, 245)
+    assert crop.metadata.snapshot_id == source.metadata.snapshot_id
+    assert crop.image.getpixel((0, 0)) == (255, 0, 0)
+    crop.discard()
+    source.discard()
+
+
+def test_field_value_crop_fails_closed_for_password_overlap_or_unbounded_geometry() -> None:
+    bounds = Rect(0, 0, 1000, 800)
+    meta = ScreenshotMetadata("crop-source", 99, bounds, bounds, 1000, 800, 96, 96, 1, 1)
+    source = ScreenshotCapture(meta, Image.new("RGB", (1000, 800), "white"))
+    with pytest.raises(PermissionError):
+        crop_screenshot_to_field(source, Rect(100, 200, 300, 240),
+                                 sensitive_regions=(Rect(90, 190, 150, 230),))
+    with pytest.raises(ValueError):
+        crop_screenshot_to_field(source, Rect(0, 0, 990, 700))
+    source.discard()
+
+
+def test_value_only_visual_response_is_machine_readable_and_fail_closed() -> None:
+    request = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+    schema = visual_schema(include_field_value_only=True)
+    prompt = directed_visual_prompt(
+        1, request.objective, verification_only=True,
+        query_field_continuity=True, field_value_only=True,
+    )
+    assert schema["required"] == ["field_value"]
+    assert set(schema["properties"]) == {"field_value"}
+    assert "Do not identify" in prompt and "nearby results" in prompt
+    assert strict_visual_field_value_json('{"field_value":"Californication"}') == "Californication"
+    assert strict_visual_field_value_json('{"field_value":null}') is None
+    for invalid in (
+        '{"field_value":"Californication","label":"Search"}',
+        '{"field_value":123}', '{"field_value":"x","field_value":"y"}',
+        'value is Californication',
+    ):
+        with pytest.raises(VisualProviderFailure, match="malformed_response"):
+            strict_visual_field_value_json(invalid)
+
+
+def test_verification_candidate_requires_typed_activity_and_rejects_unknown_values() -> None:
+    from computer.visual_providers.common import candidate_from_normalized
+
+    base = {
+        "label": "Alpha", "role": "list_item",
+        "box": {"left": 10, "top": 10, "right": 100, "bottom": 80},
+        "clickable": False, "activity": "not_active",
+        "selection_state": "not_selected", "region": "navigation",
+    }
+    candidate = candidate_from_normalized(
+        base, 1000, 800, parent_required=False, verification_only=True,
+    )
+    assert candidate.activity == "not_active"
+    assert candidate.selection_state.value == "not_selected"
+    assert candidate.region.value == "navigation"
+    with pytest.raises(VisualProviderFailure, match="invalid_response"):
+        candidate_from_normalized(
+            {key: value for key, value in base.items() if key != "activity"},
+            1000, 800, parent_required=False, verification_only=True,
+        )
+    with pytest.raises(VisualProviderFailure, match="invalid_response"):
+        candidate_from_normalized(
+            {**base, "activity": "maybe"}, 1000, 800,
+            parent_required=False, verification_only=True,
+        )
+
+
+def test_query_field_continuity_schema_separates_label_and_current_value() -> None:
+    from computer.visual_providers.common import (
+        candidate_from_normalized, directed_visual_prompt, visual_schema,
+    )
+
+    schema = visual_schema(include_query_field_continuity=True)
+    item_schema = schema["properties"]["elements"]["items"]
+    assert set(item_schema["properties"]) == {
+        "field_label", "field_value", "role", "box", "clickable", "activity",
+        "is_query_field", "credential_risk",
+    }
+    assert item_schema["properties"]["field_label"]["type"] == ["string", "null"]
+    assert item_schema["properties"]["field_value"]["type"] == ["string", "null"]
+    assert item_schema["properties"]["credential_risk"]["type"] == ["boolean", "null"]
+    assert "field_label" in item_schema["required"]
+    assert "field_value" in item_schema["required"]
+
+    prompt = directed_visual_prompt(
+        5, "Verify Californication in the active search field.",
+        verification_only=True, query_field_continuity=True,
+    )
+    assert "placeholder" in prompt and "field_value separately" in prompt
+    assert "nearby results" in prompt and "search history" in prompt
+
+    candidate = candidate_from_normalized({
+        "field_label": "¿Qué quieres reproducir?",
+        "field_value": "Californication",
+        "role": "search_field",
+        "box": {"left": 10, "top": 10, "right": 200, "bottom": 60},
+        "clickable": True,
+        "activity": "active",
+        "is_query_field": True,
+        "credential_risk": False,
+    }, 800, 600, verification_only=True, query_field_continuity=True)
+    assert candidate.label == "¿Qué quieres reproducir?"
+    assert candidate.field_label == "¿Qué quieres reproducir?"
+    assert candidate.field_value == "Californication"
+    assert candidate.is_query_field is True
+    assert candidate.credential_risk is False
+    validated = validate_visual_candidates((candidate,), metadata())
+    assert validated[0].field_label == "¿Qué quieres reproducir?"
+    assert validated[0].field_value == "Californication"
+    assert validated[0].is_query_field is True
+    assert validated[0].credential_risk is False
+
+
+def test_query_field_parser_rejects_values_on_non_query_candidates() -> None:
+    from computer.visual_providers.common import candidate_from_normalized
+
+    with pytest.raises(VisualProviderFailure, match="invalid_response"):
+        candidate_from_normalized({
+            "field_label": None, "field_value": "Californication",
+            "role": "list_item",
+            "box": {"left": 10, "top": 10, "right": 200, "bottom": 60},
+            "clickable": True, "activity": "not_active",
+            "is_query_field": False, "credential_risk": False,
+        }, 800, 600, verification_only=True, query_field_continuity=True)
 
 
 @pytest.mark.parametrize("rect", [
@@ -1121,6 +1261,50 @@ def test_visual_readiness_foreground_change_never_calls_provider(monkeypatch) ->
     result = computer.observe_directed(bounded_grounding_request("Find search", 5))
     assert result.visual_readiness.reason == "foreground_changed"
     assert provider.payloads == []
+
+
+def test_preclick_directed_observation_does_not_upload_after_trusted_context_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_root = Node(name="Spotify", handle=99, process_id=42, runtime_id=(99,))
+    changed_root = Node(name="Other", handle=100, process_id=77, runtime_id=(100,))
+    foreground = Mock(side_effect=[expected_root, changed_root])
+    monkeypatch.setattr(windows, "_foreground", foreground)
+    monkeypatch.setattr(windows_actions, "_foreground", lambda: expected_root)
+
+    class Catalog:
+        def identify(self, app_name, package_family):
+            return "trusted_spotify_app"
+
+    class Provider:
+        name = "gemini"
+        model = "test-model"
+        pricing_class = "free"
+
+        def __init__(self):
+            self.calls = []
+
+        def observe(self, screenshot, window, original_request, grounding=None):
+            self.calls.append((screenshot, window, grounding))
+            return VisualObservation((), self.name, self.model, directed_grounding=True)
+
+    provider = Provider()
+    capture = FakeCapture()
+    computer = WindowsComputer(
+        app_catalog=Catalog(), capture_service=capture, visual_provider=provider,
+    )
+    expected = Observation(
+        "spotify.exe", "Spotify", process_id=42, application_id="trusted_spotify_app",
+        observation_id="before", foreground_hwnd=99,
+    )
+
+    result = computer.observe_preclick_directed(
+        bounded_grounding_request("Find the same visible actionable target", 5), expected,
+    )
+
+    assert result.error == "trusted_context_changed"
+    assert provider.calls == []
+    assert result.visual_provider_call_count == 0
 
 
 def test_visual_readiness_uses_combined_structure_signals() -> None:

@@ -13,6 +13,7 @@ import unicodedata
 from computer.models import (
     CaptureDiagnostics, Observation, ProviderErrorDiagnostic, Rect, ScreenshotMetadata,
     ResultReadinessRichnessRatios, UIElement, VisualElement, VisualProviderAttempt,
+    VisualRegion, VisualSelectionState,
     VisualReadinessFrame, VisualRequestFingerprint,
 )
 
@@ -34,6 +35,63 @@ class ScreenshotCapture:
             close()
 
 
+def crop_screenshot_to_field(
+    screenshot: ScreenshotCapture, rectangle: Rect, *,
+    sensitive_regions: tuple[Rect, ...] = (),
+) -> ScreenshotCapture:
+    """Create a small local crop bound to one already-validated field rectangle."""
+    metadata = screenshot.metadata
+    width, height = metadata.pixel_width, metadata.pixel_height
+    if (screenshot.image is None or getattr(screenshot.image, "size", None) != (width, height)
+            or not all(math.isfinite(scale) and scale > 0
+                       for scale in (metadata.scale_x, metadata.scale_y))
+            or not all(type(value) is int for value in (
+                rectangle.left, rectangle.top, rectangle.right, rectangle.bottom,
+            ))):
+        raise ValueError("Field crop source geometry is unavailable.")
+    field_width = rectangle.right - rectangle.left
+    field_height = rectangle.bottom - rectangle.top
+    if (rectangle.left < 0 or rectangle.top < 0 or rectangle.right > width
+            or rectangle.bottom > height or field_width < 24 or field_height < 8
+            or field_width > min(1200, round(width * .95))
+            or field_height > min(160, round(height * .2))):
+        raise ValueError("Field geometry cannot be safely bounded.")
+    pad_x = min(8, max(2, field_width // 40))
+    pad_y = min(5, max(2, field_height // 8))
+    left, top = max(0, rectangle.left - pad_x), max(0, rectangle.top - pad_y)
+    right, bottom = min(width, rectangle.right + pad_x), min(height, rectangle.bottom + pad_y)
+    if right - left > 1216 or bottom - top > 176:
+        raise ValueError("Field crop exceeds the bounded size.")
+    screen_crop = Rect(
+        metadata.capture_bounds.left + round(left / metadata.scale_x),
+        metadata.capture_bounds.top + round(top / metadata.scale_y),
+        metadata.capture_bounds.left + round(right / metadata.scale_x),
+        metadata.capture_bounds.top + round(bottom / metadata.scale_y),
+    )
+    if any(
+        min(screen_crop.right, region.right) > max(screen_crop.left, region.left)
+        and min(screen_crop.bottom, region.bottom) > max(screen_crop.top, region.top)
+        for region in sensitive_regions
+    ):
+        raise PermissionError("Sensitive UI geometry overlaps the field crop.")
+    image = screenshot.image.crop((left, top, right, bottom))
+    crop_width, crop_height = getattr(image, "size", (0, 0))
+    screen_width = screen_crop.right - screen_crop.left
+    screen_height = screen_crop.bottom - screen_crop.top
+    if (crop_width < 1 or crop_height < 1 or screen_width < 1 or screen_height < 1
+            or crop_width > 1216 or crop_height > 176):
+        close = getattr(image, "close", None)
+        if callable(close):
+            close()
+        raise ValueError("Field crop dimensions are invalid.")
+    cropped_metadata = ScreenshotMetadata(
+        metadata.snapshot_id, metadata.window_handle, metadata.window_bounds,
+        screen_crop, crop_width, crop_height, metadata.dpi_x, metadata.dpi_y,
+        crop_width / screen_width, crop_height / screen_height,
+    )
+    return ScreenshotCapture(cropped_metadata, image)
+
+
 @dataclass(frozen=True, slots=True)
 class VisualCandidate:
     """Untrusted provider result before local IDs and validation."""
@@ -46,6 +104,12 @@ class VisualCandidate:
     parent: str = ""
     provider_role: str | None = None
     activity: str | None = None
+    selection_state: VisualSelectionState = VisualSelectionState.UNKNOWN
+    region: VisualRegion = VisualRegion.UNKNOWN
+    field_label: str | None = None
+    field_value: str | None = None
+    is_query_field: bool | None = None
+    credential_risk: bool | None = None
 
 
 MAX_GROUNDING_OBJECTIVE_CHARS = 240
@@ -60,6 +124,8 @@ class VisualGroundingRequest:
     objective: str
     max_elements: int = 5
     verification_only: bool = False
+    query_field_continuity: bool = False
+    field_value_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.objective.strip() or len(self.objective) > MAX_GROUNDING_OBJECTIVE_CHARS:
@@ -70,6 +136,27 @@ class VisualGroundingRequest:
             raise ValueError("max_elements must be between 1 and 100")
         if type(self.verification_only) is not bool:
             raise ValueError("verification_only must be a boolean")
+        if type(self.query_field_continuity) is not bool:
+            raise ValueError("query_field_continuity must be a boolean")
+        if type(self.field_value_only) is not bool:
+            raise ValueError("field_value_only must be a boolean")
+        if self.query_field_continuity and not self.verification_only:
+            raise ValueError("query_field_continuity requires verification_only")
+        if self.field_value_only and not (self.verification_only and self.query_field_continuity):
+            raise ValueError("field_value_only requires visual query-field verification")
+
+
+@dataclass(frozen=True, slots=True)
+class VisualFieldValueRead:
+    """Safe result of one locally cropped visual field-value extraction."""
+
+    field_value: str | None = field(default=None, repr=False)
+    crop_valid: bool = False
+    context_stable: bool = False
+    credential_safe: bool | None = None
+    provider_attempts: tuple[VisualProviderAttempt, ...] = ()
+    error: ProviderErrorDiagnostic | None = None
+    reason: str | None = None
 
 
 def bounded_grounding_request(objective: str, max_elements: int = 5) -> VisualGroundingRequest:
@@ -211,6 +298,7 @@ class VisualObservation:
     provider_attempts: tuple[VisualProviderAttempt, ...] = ()
     provider_failover_used: bool = False
     provider_failover_reason: str | None = None
+    field_value: str | None = field(default=None, repr=False)
 
 
 class ScreenCapture(Protocol):
@@ -410,7 +498,37 @@ def validate_visual_candidates_detailed(
         if candidate.activity not in {None, "active", "not_active", "unknown"}:
             rejected["other_validation_failure"] += 1
             continue
+        if candidate.selection_state not in {
+            VisualSelectionState.SELECTED,
+            VisualSelectionState.NOT_SELECTED,
+            VisualSelectionState.UNKNOWN,
+        }:
+            rejected["other_validation_failure"] += 1
+            continue
+        if candidate.region not in {
+            VisualRegion.NAVIGATION, VisualRegion.DETAIL, VisualRegion.HEADER,
+            VisualRegion.CONTENT, VisualRegion.UNKNOWN,
+        }:
+            rejected["other_validation_failure"] += 1
+            continue
+        if ((candidate.field_label is not None and not isinstance(candidate.field_label, str))
+                or (candidate.field_value is not None and not isinstance(candidate.field_value, str))
+                or (candidate.is_query_field is not None
+                    and type(candidate.is_query_field) is not bool)
+                or (candidate.credential_risk is not None
+                    and type(candidate.credential_risk) is not bool)
+                or (candidate.is_query_field is not True and candidate.field_value is not None)):
+            rejected["other_validation_failure"] += 1
+            continue
         label = _clean_text(candidate.label, max_text)
+        field_label = (
+            _clean_text(candidate.field_label, max_text)
+            if candidate.field_label is not None else None
+        )
+        field_value = (
+            _clean_text(candidate.field_value, max_text)
+            if candidate.field_value is not None else None
+        )
         raw_role = _clean_text(candidate.role, 40)
         if not label and not raw_role:
             rejected["invalid_label"] += 1
@@ -419,10 +537,17 @@ def validate_visual_candidates_detailed(
         parent = _clean_text(candidate.parent, 120)
         if redactor is not None:
             label, parent = redactor.clean(label), redactor.clean(parent)
+            field_label = redactor.clean(field_label) if field_label is not None else None
+            field_value = redactor.clean(field_value) if field_value is not None else None
         validated.append(VisualElement(
             f"v{len(validated) + 1}", label, role, rect,
             float(candidate.confidence) if candidate.confidence is not None else None,
             candidate.clickable is True, parent, activity=candidate.activity,
+            selection_state=candidate.selection_state,
+            region=candidate.region,
+            field_label=field_label, field_value=field_value,
+            is_query_field=candidate.is_query_field,
+            credential_risk=candidate.credential_risk,
         ))
     return tuple(validated), rejected
 

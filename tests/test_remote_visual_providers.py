@@ -9,7 +9,7 @@ from PIL import Image
 import pytest
 
 from computer.models import Observation, Rect, ScreenshotMetadata
-from computer.visual import ScreenshotCapture, VisualProviderFailure
+from computer.visual import ScreenshotCapture, VisualGroundingRequest, VisualProviderFailure
 from computer.visual_providers import (
     VisualProviderConfigurationError, visual_provider_from_environment,
 )
@@ -62,6 +62,19 @@ def tool_response(elements: list[dict[str, object]]) -> dict[str, object]:
         }]}}],
         "usage": {"prompt_tokens": 40, "completion_tokens": 20, "total_tokens": 60},
     }
+
+
+def field_value_response(value: str | None) -> dict[str, object]:
+    return {"choices": [{"message": {"content": json.dumps({"field_value": value})}}]}
+
+
+def field_value_tool_response(value: str | None) -> dict[str, object]:
+    return {"choices": [{"message": {"content": None, "tool_calls": [{
+        "type": "function", "function": {
+            "name": "report_visible_field_value",
+            "arguments": json.dumps({"field_value": value}),
+        },
+    }]}}]}
 
 
 def make(provider_type, result, **kwargs):
@@ -172,6 +185,38 @@ def test_ling_uses_one_forced_schema_tool_without_parallel_calls_or_fallback() -
     shot.discard()
 
 
+def test_openrouter_verification_returns_typed_active_context_fields() -> None:
+    raw = element(label="Iago")
+    raw.pop("parent")
+    raw.update({
+        "activity": "unknown", "selection_state": "selected", "region": "navigation",
+    })
+    provider, transport = make(
+        OpenRouterVisualObserver, tool_response([raw]), model=OPENROUTER_LING_VISUAL_MODEL,
+    )
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        'Determine whether "Iago" is active, not merely visible.', 5,
+        verification_only=True,
+    )
+
+    result = provider.observe(shot, Observation("app", "Window"), "ignored", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["messages"][0]["content"][0]["text"]
+    schema = payload["tools"][0]["function"]["parameters"]["properties"]["elements"]["items"]
+    assert "not merely visible" in prompt
+    assert "activity" in schema["required"]
+    assert "selection_state" in schema["required"]
+    assert "region" in schema["required"]
+    assert "parent" not in schema["properties"]
+    assert result.candidates[0].activity == "unknown"
+    assert result.candidates[0].selection_state.value == "selected"
+    assert result.candidates[0].region.value == "navigation"
+    assert result.directed_grounding and not result.execution_authorized
+    shot.discard()
+
+
 def test_ling_is_allowlisted_alongside_gemma() -> None:
     assert SUPPORTED_FREE_VISUAL_MODELS == {
         OPENROUTER_FREE_VISUAL_MODEL, OPENROUTER_LING_VISUAL_MODEL,
@@ -222,6 +267,65 @@ def test_deepseek_uses_only_current_documented_visual_model() -> None:
     shot.discard()
     with pytest.raises(ValueError, match="deepseek-flash"):
         DeepSeekVisualObserver("key", model="deepseek-chat")
+
+
+def test_deepseek_value_only_contract_returns_no_candidates() -> None:
+    provider, transport = make(DeepSeekVisualObserver, field_value_response("Californication"))
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+
+    result = provider.observe(shot, Observation("", ""), "", grounding)
+
+    prompt = transport.create.call_args.args[0]["messages"][0]["content"][0]["text"]
+    assert "Do not identify" in prompt and "nearby results" in prompt
+    assert result.field_value == "Californication" and result.candidates == ()
+    shot.discard()
+
+
+def test_openrouter_gemma_value_only_contract_is_strict_json() -> None:
+    provider, transport = make(OpenRouterVisualObserver, field_value_response("Californication"))
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+
+    result = provider.observe(shot, Observation("", ""), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    prompt = payload["messages"][0]["content"][0]["text"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "Do not identify" in prompt and result.field_value == "Californication"
+    assert result.candidates == ()
+    shot.discard()
+
+
+def test_openrouter_ling_value_only_uses_forced_value_tool_schema() -> None:
+    provider, transport = make(
+        OpenRouterVisualObserver, field_value_tool_response("Californication"),
+        model=OPENROUTER_LING_VISUAL_MODEL,
+    )
+    shot = capture()
+    grounding = VisualGroundingRequest(
+        "Read the current visible value inside the supplied text field crop.", 1,
+        verification_only=True, query_field_continuity=True, field_value_only=True,
+    )
+
+    result = provider.observe(shot, Observation("", ""), "", grounding)
+
+    payload = transport.create.call_args.args[0]
+    function = payload["tools"][0]["function"]
+    assert function["name"] == "report_visible_field_value"
+    assert set(function["parameters"]["properties"]) == {"field_value"}
+    assert payload["tool_choice"]["function"]["name"] == "report_visible_field_value"
+    assert "parallel_tool_calls" not in payload
+    assert payload["provider"]["require_parameters"] is True
+    assert payload["provider"]["allow_fallbacks"] is False
+    assert result.field_value == "Californication" and result.candidates == ()
+    shot.discard()
 
 
 @pytest.mark.parametrize("provider_type", [OpenRouterVisualObserver, DeepSeekVisualObserver])

@@ -225,6 +225,7 @@ class WindowsObserver:
         self._readiness_sleep = readiness_sleep
         self._observation_request = ""
         self._debug_capture: ScreenshotCapture | None = None
+        self._expected_visual_context: Observation | None = None
 
     def set_observation_request(self, request: str) -> None:
         self._observation_request = request[:4000]
@@ -707,7 +708,35 @@ class WindowsObserver:
         provider_started: float | None = None
         provider_call_count = 0
         try:
-            if self.visual_provider is not None and fallback.required:
+            if self.visual_provider is not None and (fallback.required or self.force_capture):
+                if self._expected_visual_context is not None:
+                    expected = self._expected_visual_context
+                    expected_hwnd = (
+                        expected.foreground_hwnd
+                        or (expected.screenshot.window_handle
+                            if expected.screenshot is not None else None)
+                    )
+                    try:
+                        current = _foreground()
+                        context_matches = bool(
+                            expected_hwnd is not None and expected_hwnd > 0
+                            and isinstance(expected.process_id, int)
+                            and expected.process_id > 0
+                            and expected.application_id
+                            and observation.application_id == expected.application_id
+                            and observation.process_id == expected.process_id
+                            and observation.foreground_hwnd == expected_hwnd
+                            and capture.metadata.window_handle == expected_hwnd
+                            and int(current.handle) == expected_hwnd  # type: ignore[attr-defined]
+                            and current.process_id == expected.process_id
+                            and (not expected.package_family_name
+                                 or observation.package_family_name == expected.package_family_name)
+                        )
+                    except Exception:
+                        context_matches = False
+                    if not context_matches:
+                        capture.discard()
+                        return replace(observation, error="trusted_context_changed")
                 provider_started = time.monotonic()
                 provider_call_count = 1
                 if self.visual_grounding is None:

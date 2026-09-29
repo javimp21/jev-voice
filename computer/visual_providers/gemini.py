@@ -15,7 +15,8 @@ from computer.visual import (
 )
 from computer.visual_providers.common import (
     HTTPSJSONTransport, JSONTransport, MetadataTransport, candidate_from_normalized,
-    directed_visual_prompt, generic_http_error, png_base64, png_fingerprint, strict_visual_json,
+    directed_visual_prompt, generic_http_error, png_base64, png_fingerprint,
+    strict_visual_field_value_json, strict_visual_json,
     visual_prompt, visual_schema,
 )
 
@@ -184,7 +185,9 @@ class GeminiVisualObserver:
             self.name, self.model, True, grounding.max_elements,
             self.directed_max_output_tokens, "application/json",
             GEMINI_VISUAL_SCHEMA_NAME,
-            "2" if grounding.verification_only else GEMINI_VISUAL_SCHEMA_VERSION,
+            ("5" if grounding.field_value_only else
+             "4" if grounding.query_field_continuity else
+             "3" if grounding.verification_only else GEMINI_VISUAL_SCHEMA_VERSION),
             (screenshot.metadata.pixel_width, screenshot.metadata.pixel_height),
             encoded_length, digest, len(grounding.objective),
         )
@@ -226,6 +229,8 @@ class GeminiVisualObserver:
                     directed_visual_prompt(
                         requested_max, grounding.objective,
                         verification_only=grounding.verification_only,
+                        query_field_continuity=grounding.query_field_continuity,
+                        field_value_only=grounding.field_value_only,
                     )
                     if grounding is not None else visual_prompt(requested_max, original_request)
                 )},
@@ -240,6 +245,12 @@ class GeminiVisualObserver:
                 "responseJsonSchema": visual_schema(
                     include_parent=not directed,
                     include_activity=bool(grounding and grounding.verification_only),
+                    include_selection_state=bool(grounding and grounding.verification_only),
+                    include_region=bool(grounding and grounding.verification_only),
+                    include_query_field_continuity=bool(
+                        grounding and grounding.query_field_continuity
+                    ),
+                    include_field_value_only=bool(grounding and grounding.field_value_only),
                 ),
             },
         }
@@ -260,16 +271,25 @@ class GeminiVisualObserver:
         latency_ms = max(0, round((self._clock() - started) * 1000))
         parse_started = self._clock()
         try:
-            parsed = strict_visual_json(_response_text(response))
-            raw_elements = parsed["elements"]
-            candidates = tuple(
-                candidate_from_normalized(
-                    raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
-                    parent_required=not directed,
-                    verification_only=bool(grounding and grounding.verification_only),
+            if grounding is not None and grounding.field_value_only:
+                field_value = strict_visual_field_value_json(_response_text(response))
+                raw_elements = []
+                candidates = ()
+            else:
+                field_value = None
+                parsed = strict_visual_json(_response_text(response))
+                raw_elements = parsed["elements"]
+                candidates = tuple(
+                    candidate_from_normalized(
+                        raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
+                        parent_required=not directed,
+                        verification_only=bool(grounding and grounding.verification_only),
+                        query_field_continuity=bool(
+                            grounding and grounding.query_field_continuity
+                        ),
+                    )
+                    for raw in raw_elements[:requested_max]
                 )
-                for raw in raw_elements[:requested_max]
-            )
         except VisualProviderFailure as exc:
             if exc.code == "invalid_response":
                 exc = VisualProviderFailure("malformed_response")
@@ -282,4 +302,5 @@ class GeminiVisualObserver:
             requested_max_elements=requested_max,
             returned_visual_elements=len(candidates), directed_grounding=directed,
             raw_element_count=len(raw_elements), parsed_element_count=len(candidates),
+            field_value=field_value,
         )

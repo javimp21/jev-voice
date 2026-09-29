@@ -12,7 +12,8 @@ from computer.visual import (
 )
 from computer.visual_providers.common import (
     HTTPSJSONTransport, JSONTransport, candidate_from_normalized, chat_output_text,
-    png_data_url, strict_visual_json, token_usage, visual_prompt,
+    directed_visual_prompt, png_data_url, strict_visual_field_value_json,
+    strict_visual_json, token_usage, visual_prompt,
 )
 
 
@@ -51,10 +52,20 @@ class DeepSeekVisualObserver:
         self, screenshot: ScreenshotCapture, window: Observation, original_request: str,
         grounding: VisualGroundingRequest | None = None,
     ) -> VisualObservation:
+        directed = grounding is not None
+        requested_max = grounding.max_elements if grounding is not None else self.max_elements
         payload = {
             "model": self.model,
             "messages": [{"role": "user", "content": [
-                {"type": "text", "text": visual_prompt(self.max_elements, original_request)},
+                {"type": "text", "text": (
+                    directed_visual_prompt(
+                        requested_max, grounding.objective,
+                        verification_only=grounding.verification_only,
+                        query_field_continuity=grounding.query_field_continuity,
+                        field_value_only=grounding.field_value_only,
+                    ) if grounding is not None
+                    else visual_prompt(requested_max, original_request)
+                )},
                 {"type": "image_url", "image_url": {
                     "url": png_data_url(screenshot), "detail": "high",
                 }},
@@ -74,13 +85,33 @@ class DeepSeekVisualObserver:
         except Exception as exc:
             raise VisualProviderFailure("api_error") from exc
         latency_ms = max(0, round((self._clock() - started) * 1000))
-        parsed = strict_visual_json(chat_output_text(response))
-        candidates = tuple(
-            candidate_from_normalized(raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height)
-            for raw in parsed["elements"][:self.max_elements]
-        )
+        if grounding is not None and grounding.field_value_only:
+            field_value = strict_visual_field_value_json(chat_output_text(response))
+            parsed_elements = []
+            candidates = ()
+        else:
+            field_value = None
+            parsed = strict_visual_json(chat_output_text(response))
+            parsed_elements = parsed["elements"]
+            candidates = tuple(
+                candidate_from_normalized(
+                    raw, screenshot.metadata.pixel_width, screenshot.metadata.pixel_height,
+                    parent_required=not bool(grounding and grounding.verification_only),
+                    verification_only=bool(grounding and grounding.verification_only),
+                    query_field_continuity=bool(
+                        grounding and grounding.query_field_continuity
+                    ),
+                )
+                for raw in parsed_elements[:requested_max]
+            )
         return VisualObservation(
             candidates, self.name, self.model, latency_ms,
             token_usage(response, ("prompt_tokens", "completion_tokens", "total_tokens")),
             False, self.pricing_class,
+            requested_max_elements=requested_max,
+            returned_visual_elements=len(candidates),
+            directed_grounding=directed,
+            raw_element_count=len(parsed_elements),
+            parsed_element_count=len(candidates),
+            field_value=field_value,
         )

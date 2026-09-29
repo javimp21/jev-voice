@@ -10,7 +10,7 @@ import pytest
 
 from computer.models import Observation, Rect, ScreenshotMetadata
 from computer.visual import (
-    ScreenshotCapture, VisualProviderFailure, bounded_grounding_request,
+    ScreenshotCapture, VisualGroundingRequest, VisualProviderFailure, bounded_grounding_request,
 )
 from computer.visual_providers.failover import GeminiVisualGrounder
 from computer.visual_providers.openai import OpenAIVisualGrounder
@@ -135,6 +135,33 @@ def test_recoverable_gemini_failure_calls_openai_once_with_same_request(
     ]
     assert all(item.elapsed_ms >= 0 for item in result.provider_attempts)
     assert result.candidates[0].confidence is None and not result.execution_authorized
+    shot.discard()
+
+
+def test_verification_only_shape_survives_existing_gemini_to_openai_failover() -> None:
+    active = {
+        **candidate(), "activity": "active", "selection_state": "selected",
+        "region": "header",
+    }
+    provider, primary, fallback = configured(
+        VisualProviderFailure("timeout"), openai_response([active]),
+    )
+    shot = capture()
+    grounding = VisualGroundingRequest("Verify Iago is active.", 3, verification_only=True)
+
+    result = provider.observe(shot, Observation("app", "Window"), "", grounding)
+
+    gemini_payload = primary.create.call_args.args[0]
+    openai_payload = fallback.create.call_args.args[0]
+    gemini_schema = gemini_payload["generationConfig"]["responseJsonSchema"]
+    openai_schema = openai_payload["text"]["format"]["schema"]
+    assert "activity" in gemini_schema["properties"]["elements"]["items"]["required"]
+    assert "activity" in openai_schema["properties"]["elements"]["items"]["required"]
+    assert "selection_state" in gemini_schema["properties"]["elements"]["items"]["required"]
+    assert "region" in openai_schema["properties"]["elements"]["items"]["required"]
+    assert result.candidates[0].activity == "active"
+    assert [attempt.provider for attempt in result.provider_attempts] == ["gemini", "openai"]
+    assert result.provider_failover_used is True
     shot.discard()
 
 
