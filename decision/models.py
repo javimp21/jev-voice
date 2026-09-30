@@ -132,6 +132,7 @@ class DecisionResult:
     model: str | None = None
     error: str | None = None
     diagnostic: str | None = None
+    provider_called: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

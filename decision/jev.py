@@ -457,6 +457,10 @@ class JevDecisionMaker:
             "selected_click_options": sum(isinstance(action, ClickAction) for action in candidates.values()),
             "selected_visual_click_options": sum(isinstance(action, VisualClickAction) for action in candidates.values()),
             "total_options": len(candidates),
+            "trusted_catalog_candidate_count": len(application_matches),
+            "trusted_catalog_match_kind": (
+                application_matches[0].match_kind if application_matches else "no_match"
+            ),
         }
         if include_grounding:
             stats["grounding_options"] = sum(
@@ -507,7 +511,18 @@ class JevDecisionMaker:
         except (ValueError, TypeError):
             return DecisionResult("error", None, None,
                                   "Invalid, oversized, or sensitive input; check the request and observation.",
-                                  observation.observation_id, error="invalid_input", diagnostic="invalid_input")
+                                  observation.observation_id, error="invalid_input", diagnostic="invalid_input",
+                                  provider_called=False)
+        if (_APPLICATION_LAUNCH_REQUEST.search(request)
+                and stats.get("trusted_catalog_match_kind") == "ambiguous"):
+            if debug_context is not None:
+                debug_context(json.loads(json.dumps({"payload": payload, "selection": stats})))
+            return DecisionResult(
+                "needs_human", None, None,
+                "More than one plausible trusted installed application matched the request.",
+                observation.observation_id, diagnostic="ambiguous_application_match",
+                provider_called=False,
+            )
         if (_APPLICATION_LAUNCH_REQUEST.search(request)
                 and not any(isinstance(action, OpenAppAction) for action in candidates.values())):
             if debug_context is not None:
@@ -516,6 +531,7 @@ class JevDecisionMaker:
                 "needs_human", None, None,
                 "No sufficiently plausible trusted installed application matched the request.",
                 observation.observation_id, diagnostic="no_application_match",
+                provider_called=False,
             )
         try:
             if debug_context is not None:
@@ -546,7 +562,7 @@ class JevDecisionMaker:
                     or probabilities[choice] < max(probabilities.values())):
                 raise InvalidResponse("Invalid probability distribution or winning option.")
             metadata = dict(observation_id=observation.observation_id, selected_option=choice,
-                            probabilities=probabilities, model=model)
+                            probabilities=probabilities, model=model, provider_called=True)
             if confidence < self.min_confidence:
                 return DecisionResult("needs_human", None, confidence,
                                       "Confidence is below the configured threshold; no action released.", **metadata)
@@ -563,19 +579,19 @@ class JevDecisionMaker:
         except APIError:
             return DecisionResult("error", None, None, "TypeSafe request failed; check credentials, access, and connectivity.",
                                   observation.observation_id, error="api_error",
-                                  diagnostic="api_transport_or_http_failure")
+                                  diagnostic="api_transport_or_http_failure", provider_called=True)
         except InvalidResponse as exc:
             return DecisionResult("error", None, None, "Malformed or unexpected TypeSafe response; no action released.",
                                   observation.observation_id, error="invalid_response",
-                                  diagnostic=_invalid_diagnostic(exc))
+                                  diagnostic=_invalid_diagnostic(exc), provider_called=True)
         except (ValueError, TypeError, KeyError):
             return DecisionResult("error", None, None, "Malformed or unexpected TypeSafe response; no action released.",
                                   observation.observation_id, error="invalid_response",
-                                  diagnostic="response_contract_violation")
+                                  diagnostic="response_contract_violation", provider_called=True)
         except Exception:
             return DecisionResult("error", None, None, "Decision service failed; no action released.",
                                   observation.observation_id, error="api_error",
-                                  diagnostic="decision_service_failure")
+                                  diagnostic="decision_service_failure", provider_called=True)
 
     def decide_hybrid(
         self, request: str, observation: Observation, history: Sequence[ActionResult] = (),
@@ -611,6 +627,16 @@ class JevDecisionMaker:
         application_matches = (
             self.app_catalog.find(request, self.app_candidate_limit) if self.app_catalog else ()
         )
+        if (_APPLICATION_LAUNCH_REQUEST.search(request)
+                and application_matches
+                and application_matches[0].match_kind == "ambiguous"):
+            return HybridDecisionResult(
+                "needs_human", None, None, None,
+                "More than one plausible trusted installed application matched the request.",
+                observation.observation_id, diagnostic="ambiguous_application_match",
+                decision_error_category="ambiguous_application_match",
+                **offer_metadata, **base_diagnostics,
+            )
         requested_app_active = any(
             match.candidate.id == observation.application_id for match in application_matches
         )

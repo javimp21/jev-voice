@@ -6,8 +6,8 @@ import pytest
 
 from agent.graph import AgentState, GraphAgent
 from agent.loop import Agent, AgentLimits
-from computer.applications import MemoryApplicationCatalog
-from computer.actions import FinishAction, PressKeyAction, TypeAction
+from computer.applications import ApplicationCandidate, MemoryApplicationCatalog
+from computer.actions import FinishAction, OpenAppAction, PressKeyAction, TypeAction
 from computer.models import Observation
 from computer.results import ActionResult
 from decision.models import DecisionResult
@@ -426,3 +426,171 @@ def test_non_graph_agent_loop_keeps_its_original_flow() -> None:
     assert result.stop_reason == "finished"
     assert len(computer.executed) == 1
     assert len(decision.calls) == 2
+
+
+def _open_app_candidate(
+    app_id: str,
+    name: str,
+    *,
+    identity_fingerprint: str | None = None,
+    source: str = "test",
+    launch_target_type: str = "other",
+) -> ApplicationCandidate:
+    return ApplicationCandidate(
+        app_id, name, source, publisher="PRIVATE_PUBLISHER",
+        process_names=(r"C:\Users\private\Apps\notepad++.exe",),
+        identity_fingerprint=identity_fingerprint,
+        launch_target_type=launch_target_type,
+    )
+
+
+def _run_open_app_diagnostic(
+    request: str,
+    candidates: tuple[ApplicationCandidate, ...],
+    decision_result: DecisionResult | None = None,
+) -> tuple[object, object]:
+    catalog = MemoryApplicationCatalog(candidates)
+    scripted = ScriptedDecision([decision_result or DecisionResult(
+        "ready", OpenAppAction(candidates[0].id), 0.95, "PRIVATE_PROMPT",
+        model="jev-latest", provider_called=True,
+    )])
+    scripted.app_catalog = catalog
+    scripted.app_candidate_limit = 5
+    result = GraphAgent(
+        FakeComputer([_observation("open-app-diagnostic")]), scripted,
+        policy=DenyPolicy(), sleep_fn=lambda _seconds: None,
+    ).run(request)
+    decide_entry = next(item for item in result.diagnostics if item.node == "DECIDE")
+    return result, decide_entry.open_app_decision
+
+
+def test_open_app_exact_unique_catalog_match_is_reported_before_jev() -> None:
+    candidate = _open_app_candidate("trusted-notepad-plus-plus", "Notepad++")
+    plain_notepad = _open_app_candidate("trusted-notepad", "Notepad")
+    result, diagnostic = _run_open_app_diagnostic(
+        "Open Notepad++", (plain_notepad, candidate),
+    )
+
+    assert result.result.stop_reason == "safety_rejected"
+    assert diagnostic.requested_action_kind == "open_app"
+    assert diagnostic.requested_app_name_normalized == "notepad++"
+    assert diagnostic.trusted_catalog_candidate_count == 1
+    assert diagnostic.trusted_catalog_match_kind == "raw_exact"
+    assert diagnostic.trusted_catalog_selected_app_id_present is True
+    assert diagnostic.catalog_resolution_before_jev is True
+    assert diagnostic.jev_was_called is True
+
+
+def test_open_app_normalized_unique_catalog_match_is_reported() -> None:
+    candidate = _open_app_candidate("trusted-notepad", "Notepad™")
+    _result, diagnostic = _run_open_app_diagnostic("Open Notepad", (candidate,))
+
+    assert diagnostic.trusted_catalog_candidate_count == 1
+    assert diagnostic.trusted_catalog_match_kind == "canonical_exact"
+    assert diagnostic.trusted_catalog_selected_app_id_present is True
+
+
+def test_open_app_ambiguous_catalog_match_is_reported_without_selection() -> None:
+    candidates = (
+        _open_app_candidate("trusted-notepad-one", "Notepad"),
+        _open_app_candidate("trusted-notepad-two", "Notepad"),
+    )
+    _result, diagnostic = _run_open_app_diagnostic("Open Notepad", candidates)
+
+    assert diagnostic.trusted_catalog_candidate_count == 2
+    assert diagnostic.trusted_catalog_match_kind == "ambiguous"
+    assert diagnostic.trusted_catalog_selected_app_id_present is False
+    assert diagnostic.candidate_count == 2
+    assert diagnostic.trusted_catalog_candidate_count == 2
+
+
+def test_open_app_diagnostics_distinguish_proven_duplicate_representations_safely() -> None:
+    candidates = (
+        _open_app_candidate(
+            "app_aaaaaaaaaaaaaaaa", "Notepad++", identity_fingerprint="shortcut:private-target-hash",
+            source="start_menu", launch_target_type="shortcut",
+        ),
+        _open_app_candidate(
+            "app_bbbbbbbbbbbbbbbb", "Notepad++", identity_fingerprint="shortcut:private-target-hash",
+            source="start_menu", launch_target_type="shortcut",
+        ),
+    )
+    _result, diagnostic = _run_open_app_diagnostic("Open Notepad++", candidates)
+
+    assert diagnostic.candidate_count == 2
+    assert diagnostic.trusted_catalog_candidate_count == 1
+    assert diagnostic.trusted_catalog_match_kind == "raw_exact"
+    assert diagnostic.trusted_catalog_selected_app_id_present is True
+    assert len(diagnostic.matching_candidates) == 2
+    assert all(item.canonical_name == "notepad++" for item in diagnostic.matching_candidates)
+    assert all(item.identity_fingerprint_present for item in diagnostic.matching_candidates)
+    assert {item.identity_equivalence_group for item in diagnostic.matching_candidates} == {
+        "identity_group_1",
+    }
+    assert all(item.duplicate_of_another_candidate for item in diagnostic.matching_candidates)
+    assert all(item.launch_target_type == "shortcut" for item in diagnostic.matching_candidates)
+
+    import json
+    from dataclasses import asdict
+    serialized = json.dumps(asdict(diagnostic))
+    for forbidden in ("private-target-hash", "C:\\Users\\private", "notepad++.exe", "PRIVATE_PUBLISHER"):
+        assert forbidden not in serialized
+
+
+def test_open_app_no_catalog_match_is_reported() -> None:
+    no_match = DecisionResult(
+        "needs_human", None, None, "PRIVATE_PROMPT",
+        diagnostic="no_application_match", provider_called=False,
+    )
+    _result, diagnostic = _run_open_app_diagnostic(
+        "Open Notepad++", (_open_app_candidate("trusted-calculator", "Calculator"),),
+        no_match,
+    )
+
+    assert diagnostic.trusted_catalog_candidate_count == 0
+    assert diagnostic.trusted_catalog_match_kind == "no_match"
+    assert diagnostic.trusted_catalog_selected_app_id_present is False
+    assert diagnostic.jev_was_called is False
+    assert diagnostic.decision_rejection_reason == "no_application_match"
+
+
+def test_jev_low_confidence_with_unique_catalog_match_is_diagnosed_without_behavior_change() -> None:
+    candidate = _open_app_candidate("trusted-notepad-plus-plus", "Notepad++")
+    low_confidence = DecisionResult(
+        "ready", OpenAppAction(candidate.id), 0.72, "PRIVATE_PROMPT",
+        model="jev-latest", provider_called=True,
+    )
+    result, diagnostic = _run_open_app_diagnostic(
+        "Open Notepad++", (candidate,), low_confidence,
+    )
+
+    assert result.result.stop_reason == "low_confidence"
+    assert diagnostic.trusted_catalog_candidate_count == 1
+    assert diagnostic.trusted_catalog_match_kind == "raw_exact"
+    assert diagnostic.decision_action_kind == "open_app"
+    assert diagnostic.decision_confidence == 0.72
+    assert diagnostic.decision_rejection_reason == "low_confidence"
+    assert diagnostic.jev_was_called is True
+
+
+def test_open_app_diagnostic_contains_no_paths_secrets_or_prompt_text() -> None:
+    candidate = _open_app_candidate(
+        r"C:\private\catalog\SECRET_TOKEN_338", "Notepad++",
+    )
+    private_prompt = "PRIVATE_USER_TASK_AND_API_KEY sk-private-901"
+    response = DecisionResult(
+        "ready", OpenAppAction(candidate.id), 0.72, private_prompt,
+        model="jev-latest", provider_called=True,
+    )
+    _result, diagnostic = _run_open_app_diagnostic(
+        "Open Notepad++", (candidate,), response,
+    )
+    from dataclasses import asdict
+    import json
+
+    serialized = json.dumps(asdict(diagnostic))
+    for forbidden in (
+        "C:\\private", "SECRET_TOKEN_338", "notepad++.exe",
+        "PRIVATE_PUBLISHER", private_prompt, "sk-private-901",
+    ):
+        assert forbidden not in serialized

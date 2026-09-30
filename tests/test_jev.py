@@ -135,6 +135,13 @@ def test_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
         JevDecisionMaker.from_environment()
 
 
+def test_default_jev_min_confidence_remains_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-only-key")
+    monkeypatch.delenv("JEV_MIN_CONFIDENCE", raising=False)
+
+    assert JevSettings.from_environment().min_confidence == 0.8
+
+
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "1.1", "not a number"])
 def test_invalid_threshold(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("TYPESAFE_API_KEY", "test-key-only")

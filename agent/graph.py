@@ -9,7 +9,10 @@ wrappers.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import combinations
+import math
+import re
 import time
 from typing import Literal, TypedDict
 from uuid import uuid4
@@ -22,6 +25,11 @@ from agent.loop import (
 from computer.actions import (
     Action, ClickAction, FinishAction, OpenAppAction, PressKeyAction,
     QuerySubmitAction, TypeAction, VisualClickAction,
+)
+from computer.applications import (
+    ApplicationCandidateDiagnostic, ApplicationIdentityComparisonDiagnostics,
+    ApplicationIdentityEvidence, ApplicationMatch, compare_application_identity_evidence,
+    diagnose_application_matches, normalize_app_identity, safe_application_id,
 )
 from computer.interfaces import Computer
 from computer.models import Observation
@@ -37,6 +45,18 @@ from agent.telemetry import (
 
 GraphOutcome = Literal["continue", "success", "failure", "pending"]
 RecoverableVerificationReason = Literal["post_action_observation_incomplete"]
+TrustedCatalogMatchKind = Literal[
+    "raw_exact", "canonical_exact", "normalized_exact", "unique_fuzzy",
+    "ambiguous", "no_match",
+]
+
+_OPEN_APP_REQUEST = re.compile(r"^\s*(?:open|launch|start|run)\s+(.+?)\s*[.!?]?\s*$", re.I)
+_SAFE_OPEN_APP_REJECTIONS = frozenset({
+    "no_application_match", "low_confidence", "needs_human", "decision_error",
+    "api_transport_or_http_failure", "invalid_response", "decision_service_failure",
+    "invalid_input", "invalid_decision_result", "invalid_decision_status",
+    "missing_or_invalid_action", "confidence_accepted",
+})
 
 _TELEMETRY_VALUES = frozenset({
     "action_executed", "action_failed", "confidence_below_threshold",
@@ -99,6 +119,175 @@ class GraphNodeDiagnostic:
     max_replans: int = 1
     replan_reason: str | None = None
     failure_recoverable: bool | None = None
+    open_app_decision: OpenAppDecisionDiagnostic | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAppDecisionDiagnostic:
+    """Allowlisted details for an explicit OPEN_APP decision only."""
+
+    requested_action_kind: Literal["open_app"]
+    requested_app_name_normalized: str | None
+    trusted_catalog_candidate_count: int
+    trusted_catalog_match_kind: TrustedCatalogMatchKind
+    trusted_catalog_selected_app_id_present: bool
+    candidate_count: int = 0
+    matching_candidates: tuple[ApplicationCandidateDiagnostic, ...] = ()
+    identity_comparisons: tuple[ApplicationIdentityComparisonDiagnostics, ...] = ()
+    decision_action_kind: str | None = None
+    decision_confidence: float | None = None
+    decision_rejection_reason: str | None = None
+    jev_was_called: bool | None = None
+    catalog_resolution_before_jev: bool = False
+
+
+def _requested_open_app_name(request: str) -> tuple[str | None, str | None]:
+    match = _OPEN_APP_REQUEST.fullmatch(request)
+    if match is None:
+        return None, None
+    raw_name = match.group(1).strip()
+    if (not raw_name or len(raw_name) > 160
+            or any(character in raw_name for character in "\\/:")
+            or re.search(r"\b(?:api[ _-]?key|token|password|secret)\b", raw_name, re.I)):
+        return raw_name, None
+    normalized = normalize_app_identity(raw_name)
+    if not normalized or len(normalized) > 80:
+        return raw_name, None
+    return raw_name, normalized
+
+
+def _open_app_match_kind(
+    matches: tuple[object, ...],
+) -> tuple[TrustedCatalogMatchKind, bool]:
+    if not matches:
+        return "no_match", False
+    match_kinds = {getattr(item, "match_kind", None) for item in matches}
+    if len(match_kinds) != 1:
+        return "ambiguous", False
+    kind = next(iter(match_kinds))
+    if kind not in {
+        "raw_exact", "canonical_exact", "normalized_exact", "unique_fuzzy", "ambiguous",
+    }:
+        kind = "ambiguous" if len(matches) > 1 else "unique_fuzzy"
+    if kind == "ambiguous" or len(matches) > 1:
+        return "ambiguous", False
+    return kind, bool(getattr(matches[0].candidate, "id", None))
+
+
+def _open_app_decision_context(request: str, decision_maker: DecisionMaker) -> OpenAppDecisionDiagnostic | None:
+    raw_name, normalized_name = _requested_open_app_name(request)
+    if raw_name is None:
+        return None
+    catalog = getattr(decision_maker, "app_catalog", None)
+    matches: tuple[object, ...] = ()
+    catalog_resolved = False
+    if catalog is not None:
+        finder = getattr(catalog, "find", None)
+        if callable(finder):
+            catalog_resolved = True
+            limit = getattr(decision_maker, "app_candidate_limit", 5)
+            try:
+                bounded_limit = limit if type(limit) is int and 1 <= limit <= 100 else 5
+                matches = tuple(finder(request, bounded_limit))
+            except Exception:
+                matches = ()
+    match_kind, selected_id_present = _open_app_match_kind(matches)
+    matching_candidates = diagnose_application_matches(
+        tuple(item for item in matches if isinstance(item, ApplicationMatch)),
+    )
+    identity_comparisons: list[ApplicationIdentityComparisonDiagnostics] = []
+    physical_candidates: list[object] = []
+    for item in matches:
+        if isinstance(item, ApplicationMatch):
+            physical_candidates.extend(item.equivalent_candidates or (item.candidate,))
+    unique_candidates: list[object] = []
+    seen_candidate_keys: set[tuple[str, str | None]] = set()
+    for candidate in physical_candidates:
+        key = (str(getattr(candidate, "id", "")), getattr(candidate, "identity_fingerprint", None))
+        if key not in seen_candidate_keys:
+            unique_candidates.append(candidate)
+            seen_candidate_keys.add(key)
+    comparer = getattr(catalog, "compare_identities", None)
+    for left, right in list(combinations(unique_candidates, 2))[:10]:
+        left_id = getattr(left, "id", "")
+        right_id = getattr(right, "id", "")
+        try:
+            if callable(comparer):
+                identity_comparisons.append(comparer(left_id, right_id))
+            else:
+                left_fingerprint = getattr(left, "identity_fingerprint", None)
+                right_fingerprint = getattr(right, "identity_fingerprint", None)
+                result = compare_application_identity_evidence(
+                    ApplicationIdentityEvidence(catalog_identity_fingerprint=left_fingerprint)
+                    if left_fingerprint else None,
+                    ApplicationIdentityEvidence(catalog_identity_fingerprint=right_fingerprint)
+                    if right_fingerprint else None,
+                )
+                identity_comparisons.append(ApplicationIdentityComparisonDiagnostics(
+                    safe_application_id(str(left_id)), safe_application_id(str(right_id)),
+                    result.comparison_attempted, result.equivalence_result,
+                    result.equivalence_signal_kind, result.compared_identity_fields_present,
+                ))
+        except Exception:
+            identity_comparisons.append(ApplicationIdentityComparisonDiagnostics(
+                safe_application_id(str(left_id)), safe_application_id(str(right_id)),
+                True, "UNKNOWN", "candidate_identity_unavailable",
+                compare_application_identity_evidence(None, None).compared_identity_fields_present,
+            ))
+    return OpenAppDecisionDiagnostic(
+        requested_action_kind="open_app",
+        requested_app_name_normalized=normalized_name,
+        trusted_catalog_candidate_count=len(matches),
+        trusted_catalog_match_kind=match_kind,
+        trusted_catalog_selected_app_id_present=selected_id_present,
+        candidate_count=(len(matching_candidates) if matching_candidates else len(matches)),
+        matching_candidates=matching_candidates,
+        identity_comparisons=tuple(identity_comparisons),
+        catalog_resolution_before_jev=catalog_resolved,
+    )
+
+
+def _complete_open_app_diagnostic(
+    diagnostic: OpenAppDecisionDiagnostic | None,
+    decision: DecisionResult,
+    confidence_threshold: float,
+) -> OpenAppDecisionDiagnostic | None:
+    if diagnostic is None:
+        return None
+    confidence = decision.confidence
+    safe_confidence = (
+        float(confidence) if type(confidence) in {int, float}
+        and math.isfinite(float(confidence)) and 0 <= confidence <= 1 else None
+    )
+    if decision.status == "error":
+        rejection = decision.diagnostic if decision.diagnostic in _SAFE_OPEN_APP_REJECTIONS else "decision_error"
+    elif decision.status == "needs_human":
+        if decision.diagnostic in _SAFE_OPEN_APP_REJECTIONS:
+            rejection = decision.diagnostic
+        else:
+            rejection = "low_confidence" if safe_confidence is not None else "needs_human"
+    elif safe_confidence is not None and safe_confidence < confidence_threshold:
+        rejection = "low_confidence"
+    elif decision.status == "ready" and decision.action is not None:
+        rejection = None
+    else:
+        rejection = "missing_or_invalid_action"
+    provider_called = decision.provider_called
+    if provider_called is None:
+        provider_called = decision.model is not None
+    action_kind = _action_kind(decision.action)
+    if action_kind is None and isinstance(decision.selected_option, str):
+        if decision.selected_option.startswith("open_"):
+            action_kind = "open_app"
+        elif decision.selected_option in {"finish", "stop"}:
+            action_kind = decision.selected_option
+    return replace(
+        diagnostic,
+        decision_action_kind=action_kind,
+        decision_confidence=safe_confidence,
+        decision_rejection_reason=rejection,
+        jev_was_called=provider_called,
+    )
 
 
 class AgentState(TypedDict, total=False):
@@ -156,6 +345,7 @@ def _append_diagnostic(
     stop_reason: StopReason | None = None,
     failure_recoverable: bool | None = None,
     replan_reason: str | None = None,
+    open_app_decision: OpenAppDecisionDiagnostic | None = None,
 ) -> tuple[GraphNodeDiagnostic, ...]:
     previous = state.get("diagnostics", ())
     # The topology performs at most six node visits per bounded action step,
@@ -177,6 +367,7 @@ def _append_diagnostic(
         replan_reason=(replan_reason if replan_reason is not None
                        else state.get("last_replan_reason")),
         failure_recoverable=classified_recoverable,
+        open_app_decision=open_app_decision,
     )
     return (*previous[-(cap - 1):], item)
 
@@ -410,6 +601,9 @@ class GraphAgent:
                     "Choose based on the current observation and prior action history; "
                     "do not retry an action automatically."
                 )
+            open_app_diagnostic = _open_app_decision_context(
+                request, self.decision_maker,
+            )
             try:
                 decision = self.decision_maker.decide(
                     decision_request, observation, recent_history,
@@ -420,17 +614,27 @@ class GraphAgent:
                 return _stop_update(
                     state, "DECIDE", "decision_exception", "decision_error",
                     "Decision failed.", observation=observation,
+                    open_app_decision=(
+                        replace(
+                            open_app_diagnostic, jev_was_called=True,
+                            decision_rejection_reason="decision_error",
+                        ) if open_app_diagnostic is not None else None
+                    ),
                 )
             if not isinstance(decision, DecisionResult):
                 return _stop_update(
                     state, "DECIDE", "invalid_decision_result", "decision_error",
                     "Decision returned an invalid result.", observation=observation,
+                    open_app_decision=open_app_diagnostic,
                 )
+            open_app_diagnostic = _complete_open_app_diagnostic(
+                open_app_diagnostic, decision, self.limits.confidence_threshold,
+            )
             if decision.status not in {"ready", "needs_human", "error"}:
                 return _stop_update(
                     state, "DECIDE", "invalid_decision_status", "decision_error",
                     "Decision returned an invalid status.", observation=observation,
-                    decision=decision,
+                    decision=decision, open_app_decision=open_app_diagnostic,
                 )
             if decision.status == "error" and decision.error in _RETRYABLE_DECISION_ERRORS:
                 try:
@@ -443,17 +647,27 @@ class GraphAgent:
                     return _stop_update(
                         state, "DECIDE", "decision_retry_exception", "decision_error",
                         "Decision failed.", observation=observation,
+                        open_app_decision=(
+                            replace(
+                                open_app_diagnostic, jev_was_called=True,
+                                decision_rejection_reason="decision_error",
+                            ) if open_app_diagnostic is not None else None
+                        ),
                     )
                 if not isinstance(decision, DecisionResult):
                     return _stop_update(
                         state, "DECIDE", "invalid_retry_result", "decision_error",
                         "Decision returned an invalid result.", observation=observation,
+                        open_app_decision=open_app_diagnostic,
                     )
+                open_app_diagnostic = _complete_open_app_diagnostic(
+                    open_app_diagnostic, decision, self.limits.confidence_threshold,
+                )
             if decision.status == "error":
                 return _stop_update(
                     state, "DECIDE", "decision_error", "decision_error",
                     "Decision could not produce a valid action.", observation=observation,
-                    decision=decision,
+                    decision=decision, open_app_decision=open_app_diagnostic,
                 )
             if decision.status == "needs_human":
                 reason: StopReason = (
@@ -464,19 +678,20 @@ class GraphAgent:
                 return _stop_update(
                     state, "DECIDE", "decision_needs_human", reason,
                     "The decision requires human input.", observation=observation,
-                    decision=decision,
+                    decision=decision, open_app_decision=open_app_diagnostic,
                 )
             if not _is_action(decision.action):
                 return _stop_update(
                     state, "DECIDE", "missing_or_invalid_action", "decision_error",
                     "Decision did not provide a valid action.", observation=observation,
-                    decision=decision,
+                    decision=decision, open_app_decision=open_app_diagnostic,
                 )
             if decision.confidence is None or decision.confidence < self.limits.confidence_threshold:
                 return _stop_update(
                     state, "DECIDE", "confidence_below_threshold", "low_confidence",
                     "Decision confidence is below the execution threshold.", observation=observation,
                     decision=decision, action=decision.action,
+                    open_app_decision=open_app_diagnostic,
                 )
             action = decision.action
             decision_reason = "decision_after_replan" if replanning else "decision_ready"
@@ -487,6 +702,7 @@ class GraphAgent:
                 "diagnostics": _append_diagnostic(
                     state, "DECIDE", decision_reason, observation=observation,
                     action=action, success=True, replan_reason=replan_reason,
+                    open_app_decision=open_app_diagnostic,
                 ),
             }
 
@@ -884,6 +1100,7 @@ def _stop_update(
     decision: DecisionResult | None = None,
     action: Action | None = None,
     failure_recoverable: bool = False,
+    open_app_decision: OpenAppDecisionDiagnostic | None = None,
 ) -> dict[str, object]:
     return {
         "observation": observation if observation is not None else state.get("observation"),
@@ -897,6 +1114,7 @@ def _stop_update(
             state, node, reason, observation=observation or state.get("observation"),
             action=action or state.get("action"), success=False, stop_reason=stop_reason,
             failure_recoverable=failure_recoverable,
+            open_app_decision=open_app_decision,
         ),
     }
 

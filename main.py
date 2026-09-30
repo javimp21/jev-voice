@@ -281,6 +281,311 @@ def _save_exact_generic_capture(
     )
 
 
+def _planner_result_payload(result) -> dict[str, object]:
+    """Serialize only planner metadata; omit objective, targets, and literals."""
+    plan = result.plan
+    return {
+        "success": result.success,
+        "stop_reason": result.stop_reason,
+        "message": "Planner run completed." if result.success else "Planner run stopped safely.",
+        "steps_completed": result.steps_completed,
+        "steps_attempted": result.steps_attempted,
+        "total_steps": result.total_steps,
+        "planner_replan_count": result.planner_replan_count,
+        "max_planner_replans": result.max_planner_replans,
+        "local_replan_count": result.local_replan_count,
+        "planner_latency_ms": result.planner_latency_ms,
+        "error_category": result.error_category,
+        "provider_diagnostic": (
+            result.provider_diagnostic.as_dict()
+            if result.provider_diagnostic is not None else None
+        ),
+        "validation_diagnostic": (
+            result.validation_diagnostic.as_dict()
+            if result.validation_diagnostic is not None else None
+        ),
+        "plan": None if plan is None else [
+            {
+                "step_id": step.step_id,
+                "kind": step.kind.value,
+                "status": step.status.value,
+                "attempts": step.attempts,
+                "failure_reason": step.last_failure_reason.value if step.last_failure_reason else None,
+            }
+            for step in plan.steps
+        ],
+    }
+
+
+def _run_planner_debug(args: argparse.Namespace) -> int:
+    """Run the isolated typed-planner path; dry-run does not touch Windows/Jev."""
+    from uuid import uuid4
+
+    from agent.loop import AgentLimits
+    from agent.planner import (
+        MAX_PLAN_STEPS, OpenAIPlanner, PlannerCallError, PlannerConfigurationError, PlannerContext,
+        PlanValidationError, validate_plan,
+    )
+    from agent.telemetry import AgentTelemetryEvent, utc_timestamp
+    from agent.planner_agent import PlannerAgent
+
+    def fail(
+        reason: str, message: str,
+        validation_diagnostic: dict[str, object] | None = None,
+        provider_diagnostic: dict[str, object] | None = None,
+        error_category: str | None = None,
+    ) -> int:
+        payload: dict[str, object] = {
+            "success": False, "stop_reason": reason, "message": message,
+        }
+        if validation_diagnostic is not None:
+            payload["validation_diagnostic"] = validation_diagnostic
+        if provider_diagnostic is not None:
+            payload["provider_diagnostic"] = provider_diagnostic
+        if error_category in {
+            "timeout", "connection_error", "authentication_error", "rate_limited",
+            "bad_request", "model_not_found", "structured_output_error",
+            "server_error", "unknown_provider_error",
+        }:
+            payload["error_category"] = error_category
+        print(json.dumps(payload, indent=2), file=sys.stderr)
+        return 1
+
+    request = args.request
+    if not isinstance(request, str) or not request.strip() or len(request) > 4_000:
+        return fail("plan_validation_failed", "Task must contain 1 to 4000 characters.")
+    max_steps = args.max_steps
+    if max_steps is None:
+        try:
+            max_steps = int(os.environ.get("AGENT_MAX_STEPS", "8"))
+        except ValueError:
+            return fail("plan_validation_failed", "AGENT_MAX_STEPS must be an integer.")
+    if type(max_steps) is not int or not 1 <= max_steps <= MAX_PLAN_STEPS:
+        return fail("plan_validation_failed", "Planner max-steps must be between 1 and 8.")
+    try:
+        planner = OpenAIPlanner.from_environment()
+    except PlannerConfigurationError:
+        return fail("planner_configuration_error", "Planner configuration is unavailable.")
+    except ImportError:
+        return fail("planner_configuration_error", "Planner dependencies are unavailable.")
+
+    run_id = uuid4().hex
+    started = time.perf_counter()
+
+    sink = JsonlTelemetrySink()
+
+    def emit_planner_event(event: AgentTelemetryEvent) -> None:
+        try:
+            sink.emit(event)
+        except Exception:
+            pass
+
+    try:
+        candidate = planner.plan(request, PlannerContext(max_steps))
+        plan = validate_plan(candidate, request, max_steps=max_steps)
+    except KeyboardInterrupt:
+        return 130
+    except PlannerCallError as exc:
+        elapsed = max(0, round((time.perf_counter() - started) * 1000))
+        emit_planner_event(AgentTelemetryEvent(
+            event_type="planner_called", run_id=run_id, planner_run_id=run_id,
+            timestamp=utc_timestamp(), planner_called=True, planner_latency_ms=elapsed,
+        ))
+        return fail(
+            "planner_error", "The planner did not return a usable structured plan.",
+            provider_diagnostic=exc.diagnostic.as_dict(),
+            error_category=exc.category,
+        )
+    except PlanValidationError as exc:
+        elapsed = max(0, round((time.perf_counter() - started) * 1000))
+        now = utc_timestamp()
+        emit_planner_event(AgentTelemetryEvent(
+            event_type="planner_called", run_id=run_id, planner_run_id=run_id,
+            timestamp=now, planner_called=True, planner_latency_ms=elapsed,
+        ))
+        emit_planner_event(AgentTelemetryEvent(
+            event_type="plan_validation", run_id=run_id, planner_run_id=run_id,
+            timestamp=utc_timestamp(), plan_validation_result="rejected",
+            validation_stage=exc.diagnostic.validation_stage,
+            validation_code=exc.diagnostic.validation_code,
+            validation_reason_category=exc.diagnostic.reason_category,
+            validation_step_index=exc.diagnostic.step_index,
+            validation_step_kind=exc.diagnostic.step_kind,
+            validation_field_name=exc.diagnostic.field_name,
+            validation_field_path=exc.diagnostic.field_path,
+            validation_error_type=exc.diagnostic.error_type,
+        ))
+        return fail(
+            "plan_validation_failed", "The planner output failed local validation.",
+            exc.diagnostic.as_dict(),
+        )
+    except Exception:
+        elapsed = max(0, round((time.perf_counter() - started) * 1000))
+        emit_planner_event(AgentTelemetryEvent(
+            event_type="planner_called", run_id=run_id, planner_run_id=run_id,
+            timestamp=utc_timestamp(), planner_called=True, planner_latency_ms=elapsed,
+        ))
+        emit_planner_event(AgentTelemetryEvent(
+            event_type="plan_validation", run_id=run_id, planner_run_id=run_id,
+            timestamp=utc_timestamp(), plan_validation_result="rejected",
+        ))
+        return fail("planner_error", "The planner did not return a usable structured plan.")
+
+    elapsed = max(0, round((time.perf_counter() - started) * 1000))
+    emit_planner_event(AgentTelemetryEvent(
+        event_type="planner_called", run_id=run_id, planner_run_id=run_id,
+        timestamp=utc_timestamp(), planner_called=True, planner_latency_ms=elapsed,
+        plan_step_count=len(plan.steps),
+    ))
+    emit_planner_event(AgentTelemetryEvent(
+        event_type="plan_validation", run_id=run_id, planner_run_id=run_id,
+        timestamp=utc_timestamp(), plan_validation_result="accepted",
+        plan_step_count=len(plan.steps),
+    ))
+    preview = {
+        "success": True,
+        "stop_reason": "dry_run" if args.dry_run else "awaiting_confirmation",
+        "message": "A valid plan was created; no task content is shown.",
+        "plan": [
+            {"step_id": step.step_id, "kind": step.kind.value}
+            for step in plan.steps
+        ],
+    }
+    print(json.dumps(preview, indent=2, ensure_ascii=True))
+    if args.dry_run:
+        return 0
+
+    print(
+        "EXPERIMENTAL PLANNER RUN: a validated plan may execute safety-checked Windows actions. Continue? [y/N]",
+        file=sys.stderr,
+    )
+    try:
+        answer = input().strip().casefold()
+    except (EOFError, KeyboardInterrupt):
+        return 130
+    if answer not in {"y", "yes"}:
+        print("Planner run cancelled.", file=sys.stderr)
+        return 1
+
+    try:
+        catalog = WindowsApplicationCatalog()
+        decision_maker = JevDecisionMaker.from_environment(catalog)
+        visual_provider = visual_provider_from_environment()
+        computer = WindowsComputer(
+            ObservationOptions(), app_catalog=catalog,
+            capture_service=WindowsWindowCapture() if visual_provider else None,
+            visual_provider=visual_provider,
+        )
+        agent = PlannerAgent(
+            planner, computer, decision_maker,
+            policy=AutonomousActionPolicy(catalog),
+            confirmation=_PlannerCliConfirmation(),
+            limits=AgentLimits(
+                max_steps=max_steps,
+                confidence_threshold=float(getattr(decision_maker, "min_confidence", 0.8)),
+            ),
+            max_planner_replans=args.max_planner_replans,
+            telemetry_collector=sink,
+            app_catalog=catalog,
+        )
+    except (ConfigurationError, VisualProviderConfigurationError):
+        return fail("planner_configuration_error", "Decision or visual provider configuration is unavailable.")
+    except KeyboardInterrupt:
+        return 130
+    try:
+        result = agent.run(request, initial_plan=plan)
+    except KeyboardInterrupt:
+        return 130
+    print(json.dumps(_planner_result_payload(result), indent=2, ensure_ascii=True))
+    return 0 if result.success else 1
+
+
+def _run_planner_provider_check() -> int:
+    """Exercise only the planner's Responses/Pydantic provider adapter."""
+
+    from agent.planner import (
+        OpenAIPlanner, PlannerCallError, PlannerConfigurationError, PlannerContext,
+        _safe_model_name,
+    )
+
+    try:
+        planner = OpenAIPlanner.from_environment()
+    except (PlannerConfigurationError, ImportError):
+        print(json.dumps({
+            "success": False,
+            "provider_stage": "configuration",
+            "error_category": "configuration_error",
+            "structured_output_error": False,
+        }, indent=2))
+        return 1
+    except Exception:
+        # Client construction failures can contain local configuration detail;
+        # keep this diagnostic bounded and never print the exception string.
+        print(json.dumps({
+            "success": False,
+            "provider_stage": "client_initialization",
+            "error_category": "unknown_provider_error",
+            "structured_output_error": False,
+        }, indent=2))
+        return 1
+
+    model_name = _safe_model_name(planner.model) or "unavailable"
+    try:
+        # This fixed one-step request probes the same OpenAI client,
+        # responses.parse call, and ProviderPlan schema as normal planning.
+        planner.plan("Return a one-step plan that only finishes.", PlannerContext(1))
+    except PlannerCallError as exc:
+        diagnostic = exc.diagnostic
+        result: dict[str, object] = {
+            "success": False,
+            "model_name": model_name,
+            "provider_stage": diagnostic.provider_stage,
+            "error_category": exc.category,
+            "structured_output_error": diagnostic.structured_output_error,
+        }
+        if diagnostic.http_status is not None:
+            result["http_status"] = diagnostic.http_status
+        if diagnostic.provider_error_code is not None:
+            result["provider_error_code"] = diagnostic.provider_error_code
+        if diagnostic.request_id is not None:
+            result["request_id"] = diagnostic.request_id
+        print(json.dumps(result, indent=2))
+        return 1
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        print(json.dumps({
+            "success": False,
+            "model_name": model_name,
+            "provider_stage": "request",
+            "error_category": "unknown_provider_error",
+            "structured_output_error": False,
+        }, indent=2))
+        return 1
+
+    print(json.dumps({
+        "success": True,
+        "model_name": model_name,
+        "parsed_schema": True,
+    }, indent=2))
+    return 0
+
+
+class _PlannerCliConfirmation:
+    """A content-free terminal confirmation for consequential graph actions."""
+
+    def confirm(self, action, reason: str) -> bool:
+        del action, reason
+        print(
+            "This action requires separate safety confirmation. Continue? [y/N]",
+            file=sys.stderr,
+        )
+        try:
+            return input().strip().casefold() in {"y", "yes"}
+        except EOFError:
+            return False
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     # A project-local .env is convenient for development. Existing process
     # variables remain authoritative, and python-dotenv does not print values.
@@ -352,6 +657,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "eval-agent", help="Run deterministic offline evaluations of the LangGraph runtime",
     )
     eval_agent.add_argument("--json", action="store_true", help="Print the full evaluation report as JSON")
+    planner_agent = commands.add_parser(
+        "run-agent-planner-debug",
+        help="Experimentally plan a task, then execute typed subgoals through LangGraph and Jev",
+    )
+    planner_agent.add_argument("request")
+    planner_agent.add_argument("--dry-run", action="store_true", help="Plan and validate without Windows observation or actions")
+    planner_agent.add_argument("--max-steps", type=int, default=None)
+    planner_agent.add_argument("--max-planner-replans", type=int, choices=range(4), default=1)
+    commands.add_parser(
+        "planner-provider-check",
+        help="Safely test planner OpenAI Responses and structured-output connectivity",
+    )
     generic_agent = commands.add_parser(
         "run-agent-generic-debug",
         help="Experimentally activate one generic target with bounded optional search",
@@ -488,6 +805,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(format_eval_report(report))
         return 0 if report.failed == 0 else 1
+    if args.command == "run-agent-planner-debug":
+        return _run_planner_debug(args)
+    if args.command == "planner-provider-check":
+        return _run_planner_provider_check()
     voice_diagnostics: dict[str, object] | None = None
     voice_ready_at: float | None = None
     if args.command in {"voice-transcribe", "run-agent-voice-debug"}:

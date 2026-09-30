@@ -1228,6 +1228,42 @@ and invalid decisions. The report includes scenario pass rate, average steps
 and replans, stop-reason distribution, and node transition counts. Evaluation
 does not emit the agent's runtime JSONL file.
 
+### Experimental typed planner
+
+`run-agent-planner-debug` is a parallel System-2 path. A separate OpenAI
+Responses API adapter returns a strict Pydantic `Plan`; local validation then
+hands one high-level subgoal at a time to the existing LangGraph runtime.
+Jev still chooses the current low-level action from fresh UI evidence, and the
+existing policy, confirmation, trusted application catalog, executor, and
+graph-local replan remain in force. A bounded planner replan is available only
+after an execution failure and requires another complete fresh observation.
+The planner cannot emit clicks, control IDs, coordinates, shell commands, or
+tool names. Only six closed step kinds are accepted: `OPEN_APP`,
+`ACTIVATE_TARGET`, `SEARCH`, `PRESS_KEY`, `TYPE_TEXT`, and `FINISH`.
+
+Set `PLANNER_API_KEY` separately from `TYPESAFE_API_KEY`, `OPENAI_API_KEY`,
+and other provider credentials. `PLANNER_MODEL` is configurable and defaults
+to `gpt-6-luna`; `PLANNER_TIMEOUT_SECONDS` defaults to 30 seconds. The adapter
+uses the SDK's native Pydantic structured-output parsing. Dry-run contacts only
+the planner provider and does not initialize Jev or Windows; the live command
+shows only step IDs and kinds before asking for confirmation. The CLI response
+and planner telemetry omit objectives, targets, typed literals, prompts,
+observations, screenshots, and geometry. Planner output and API calls can
+contain user task text, so configure the provider account accordingly. Live
+planning and bounded replan requests can incur API charges.
+
+Examples from PowerShell:
+
+```powershell
+python main.py run-agent-planner-debug "Open Notepad and type hello" --dry-run
+python main.py run-agent-planner-debug "Open Notepad and type hello" --max-steps 4 --max-planner-replans 1
+```
+
+Plan length is limited to eight steps, and planner replans are limited to zero
+through three (one by default). The planner does not migrate or replace the
+existing `run-agent`, generic, voice, graph, FastAPI, or MCP routes. No planner
+provider call or Windows action is made by the automated tests.
+
 ## Local FastAPI service
 
 The experimental LangGraph runtime can also be called through a small local

@@ -10,7 +10,10 @@ from threading import Lock
 from typing import Literal, Protocol
 
 
-EventType = Literal["run_started", "node_completed", "run_completed"]
+EventType = Literal[
+    "run_started", "node_completed", "run_completed", "planner_called",
+    "plan_validation", "plan_step_started", "planner_replanned",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +23,7 @@ class AgentTelemetryEvent:
     event_type: EventType
     run_id: str
     timestamp: str
+    planner_run_id: str | None = None
     started_at: str | None = None
     ended_at: str | None = None
     total_duration_ms: int | None = None
@@ -38,6 +42,22 @@ class AgentTelemetryEvent:
     provider_latency_ms: int | None = None
     recoverable_failure: bool | None = None
     safety_outcome: str | None = None
+    planner_called: bool | None = None
+    planner_latency_ms: int | None = None
+    plan_step_count: int | None = None
+    current_plan_step: str | None = None
+    plan_step_kind: str | None = None
+    planner_replan_count: int | None = None
+    planner_replan_reason: str | None = None
+    plan_validation_result: Literal["accepted", "rejected"] | None = None
+    validation_stage: str | None = None
+    validation_code: str | None = None
+    validation_reason_category: str | None = None
+    validation_step_index: int | None = None
+    validation_step_kind: str | None = None
+    validation_field_name: str | None = None
+    validation_field_path: str | None = None
+    validation_error_type: str | None = None
 
 
 class TelemetryCollector(Protocol):

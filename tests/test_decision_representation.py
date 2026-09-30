@@ -100,9 +100,10 @@ def test_presentation_omissions_do_not_signal_missing_task_evidence(noisy_observ
     assert stats == {
         "observed_controls": 8, "eligible_controls": 8, "selected_controls": 4,
         "presentation_omitted": 4, "privacy_omitted": 0, "budget_omitted": 0,
-            "eligible_click_options": 3, "selected_click_options": 3, "total_options": 11,
-            "selected_visual_click_options": 0,
-        }
+        "eligible_click_options": 3, "selected_click_options": 3, "total_options": 11,
+        "selected_visual_click_options": 0,
+        "trusted_catalog_candidate_count": 0, "trusted_catalog_match_kind": "no_match",
+    }
     assert set(key for key in candidates if key.startswith("click_")) == {"click_c1", "click_c10", "click_c13"}
 
 
